@@ -37,3 +37,5 @@ results/
 *.tsv
 *.csv
 output.out
+
+implementation_plan.md
