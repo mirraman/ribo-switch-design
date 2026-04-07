@@ -5,7 +5,7 @@ from typing import Optional
 class Base(IntEnum): 
 	A = 0; C = 1; G = 2; U = 3
 
-class BasePair(Int	Enum): 
+class BasePair(IntEnum): 
 	AU = 0; UA = 1; CG = 2; GC = 3; GU = 4; UG = 5
 
 CANONICAL_PAIRS: set[tuple[Base, Base]] = {
@@ -56,7 +56,7 @@ class BulgeLoop:
 	side: str
 
 @dataclass
-class Multiloop:
+class MultiLoop:
 	closing_pair: tuple[int, int]
 	branches: list[tuple[int, int]]
 	unpaired: list[int]
@@ -66,4 +66,4 @@ class ExternalLoop:
 	unpaired: list[int]
 	closing_pairs: list[tuple[int, int]]
 
-LoopType = HairpinLoop | StackLoop | InteriorLoop | BulgeLoop | Multiloop | ExternalLoop		
+LoopType = HairpinLoop | StackLoop | InteriorLoop | BulgeLoop | MultiLoop | ExternalLoop		
