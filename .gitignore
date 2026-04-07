@@ -39,3 +39,5 @@ results/
 output.out
 
 implementation_plan.md
+*.txt
+*tests*
