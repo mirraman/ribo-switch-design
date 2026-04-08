@@ -2,8 +2,8 @@
 main.py — CLI entry point for riboswitch sequence design.
 
 Usage:
-    ribo-design "(((....)))..." "....(((....)))" --samples 1000 --top-k 10
-    ribo-design --input structures.txt --output results.tsv
+    ribo-design "(((....)))..." "....(((....)))" --population 100 --generations 200
+    ribo-design --input structures.txt --output results.json
 """
 
 import sys
@@ -11,34 +11,35 @@ import time
 import click
 
 from ribo_switch.turner import TurnerParams
-from ribo_switch.optimizer import RiboswitchOptimizer, OptimizerConfig
-from ribo_switch.io_utils import read_structure_pair, write_results
+from ribo_switch.nsga2 import nsga2, summarize_pareto_front
+from ribo_switch.io_utils import read_structure_pair, write_results, write_pareto_json
+from ribo_switch.viz import format_pareto_table
 
 
 @click.command()
 @click.argument('structure1', required=False)
 @click.argument('structure2', required=False)
 @click.option('--input', '-i', 'input_file', help='Read structures from file')
-@click.option('--output', '-o', default='results.tsv', help='Output file')
-@click.option('--samples', '-n', default=1000, help='Boltzmann samples')
-@click.option('--top-k', '-k', default=20, help='Top candidates to report')
-@click.option('--mutations', '-m', default=50, help='Mutations per seed')
-@click.option('--temperature', '-t', default=37.0, help='Temperature (°C)')
+@click.option('--output', '-o', default='results.json', help='Output file (JSON)')
+@click.option('--population', '-p', default=100, help='Population size')
+@click.option('--generations', '-g', default=200, help='Number of generations')
+@click.option('--mutation-rate', '-m', default=0.1, help='Mutation rate (0-1)')
 @click.option('--seed', '-s', default=None, type=int, help='Random seed')
 @click.option('--verbose', '-v', is_flag=True, help='Show progress')
+@click.option('--top-k', '-k', default=20, help='Top candidates to display')
 def design(
     structure1, structure2, input_file, output,
-    samples, top_k, mutations, temperature, seed, verbose,
+    population, generations, mutation_rate, seed, verbose, top_k,
 ):
-    """Design riboswitch sequences for two target structures.
+    """Design riboswitch sequences using NSGA-II evolutionary optimization.
 
     Provide structures as arguments or via --input file.
 
     Examples:
 
-        ribo-design "(((....))).." "..(((....).))" -n 500 -k 10 -v
+        ribo-design "(((....))).." "..(((....).))" -p 100 -g 200 -v
 
-        ribo-design -i my_structures.txt -o results.tsv -n 2000 -v
+        ribo-design -i my_structures.txt -o results.json -p 50 -g 100 -v
     """
     # Get structures
     if input_file:
@@ -58,49 +59,65 @@ def design(
         click.echo(f"Error: structure lengths differ ({len(s1)} vs {len(s2)})", err=True)
         sys.exit(1)
 
-    click.echo(f"Riboswitch Design — {len(s1)} nt")
-    click.echo(f"  S1: {s1}")
-    click.echo(f"  S2: {s2}")
+    click.echo(f"Riboswitch Design (NSGA-II) — {len(s1)} nt")
+    click.echo(f"  S_ON:  {s1}")
+    click.echo(f"  S_OFF: {s2}")
+    click.echo(f"  Population: {population}, Generations: {generations}")
     click.echo()
-
-    config = OptimizerConfig(
-        n_samples=samples,
-        top_k=top_k,
-        n_mutations=mutations,
-        temperature=temperature,
-        seed=seed,
-    )
 
     params = TurnerParams.turner2004()
 
+    # Progress callback
+    last_report = [0]
+    def progress_callback(gen, front):
+        if verbose and (gen % 10 == 0 or gen == generations - 1):
+            summary = summarize_pareto_front(front)
+            click.echo(f"  Gen {gen:4d}: {summary['count']:3d} solutions, "
+                       f"mean gap = {summary.get('gap_on_mean', 0)/100:.2f} + {summary.get('gap_off_mean', 0)/100:.2f}")
+            last_report[0] = gen
+
     start = time.time()
-    optimizer = RiboswitchOptimizer(s1, s2, params, config)
-    results = optimizer.run(verbose=verbose)
+    
+    if verbose:
+        click.echo("Running NSGA-II optimization...")
+    
+    pareto_front = nsga2(
+        structure_on=s1,
+        structure_off=s2,
+        population_size=population,
+        n_generations=generations,
+        mutation_rate=mutation_rate,
+        params=params,
+        seed=seed,
+        callback=progress_callback if verbose else None,
+    )
+    
     elapsed = time.time() - start
 
-    if not results:
+    if not pareto_front:
         click.echo("No valid candidates found.", err=True)
         sys.exit(1)
 
-    # Display top results
+    # Display summary
+    summary = summarize_pareto_front(pareto_front)
+    
     click.echo(f"\n{'='*70}")
-    click.echo(f"Top {min(len(results), top_k)} candidates ({elapsed:.1f}s)")
+    click.echo(f"Optimization complete ({elapsed:.1f}s)")
     click.echo(f"{'='*70}")
-    click.echo(f"{'#':>3}  {'Sequence':<{len(s1)+2}} {'E1':>6} {'E2':>6} "
-               f"{'MFE':>6} {'Gap1':>5} {'Gap2':>5} {'Score':>7}")
-    click.echo(f"{'-'*70}")
+    click.echo(f"Pareto front: {summary['count']} solutions")
+    click.echo(f"  Gap_ON:  min={summary['gap_on_min']/100:.2f}, mean={summary['gap_on_mean']/100:.2f}, max={summary['gap_on_max']/100:.2f} kcal/mol")
+    click.echo(f"  Gap_OFF: min={summary['gap_off_min']/100:.2f}, mean={summary['gap_off_mean']/100:.2f}, max={summary['gap_off_max']/100:.2f} kcal/mol")
+    click.echo(f"  Ideal (both gaps = 0): {summary['ideal_count']} solutions")
+    click.echo()
 
-    for i, r in enumerate(results[:top_k], 1):
-        click.echo(
-            f"{i:3d}  {r.sequence:<{len(s1)+2}} "
-            f"{r.energy_s1:6.2f} {r.energy_s2:6.2f} "
-            f"{r.mfe_energy:6.2f} {r.gap_s1:5.2f} {r.gap_s2:5.2f} "
-            f"{r.combined_score:7.2f}"
-        )
+    # Display top candidates
+    click.echo(f"Top {min(len(pareto_front), top_k)} candidates:")
+    click.echo(format_pareto_table(pareto_front, max_rows=top_k))
+    click.echo()
 
     # Write to file
-    write_results(results, output)
-    click.echo(f"\nResults written to {output}")
+    write_pareto_json(pareto_front, output, s1, s2)
+    click.echo(f"Results written to {output}")
 
 
 def main():

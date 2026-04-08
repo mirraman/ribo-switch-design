@@ -1,15 +1,16 @@
 """
 scorer.py — Candidate sequence scoring.
 
-Implements the Huang & Reidys quality criterion: a good riboswitch
-candidate has both S1 and S2 ranking close to MFE for the designed
-sequence. The combined score captures:
-  - How stable each target structure is (energy)
-  - How close each target structure is to the MFE (energy gap)
-  - How balanced the two structures are (energy difference)
+Implements scoring metrics for riboswitch candidates:
+  - MFE gap: how close target structures are to MFE
+  - Ensemble defect: probability-weighted structural distance (optional)
+  - Pareto rank integration: works with NSGA-II results
+
+Reference: Huang & Reidys (2021), Dirks et al. (2004)
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 from ribo_switch.types import Base, Sequence, Structure
 from ribo_switch.turner import TurnerParams
@@ -26,17 +27,26 @@ class CandidateResult:
         energy_s1: ΔG(seq, S1) in kcal/mol.
         energy_s2: ΔG(seq, S2) in kcal/mol.
         mfe_energy: MFE energy of the sequence in kcal/mol.
+        mfe_structure: MFE structure in dot-bracket notation.
         gap_s1: E(S1) - MFE — how far S1 is from optimal (0 = S1 is MFE).
         gap_s2: E(S2) - MFE — how far S2 is from optimal.
         combined_score: Overall quality metric (lower is better).
+        pareto_rank: Rank in Pareto front (0 = non-dominated, None if not computed).
+        stability: E(S1) + E(S2) — total structural stability.
     """
     sequence: str
     energy_s1: float
     energy_s2: float
     mfe_energy: float
+    mfe_structure: str
     gap_s1: float
     gap_s2: float
     combined_score: float
+    pareto_rank: Optional[int] = None
+    stability: float = 0.0
+    
+    def __post_init__(self):
+        self.stability = self.energy_s1 + self.energy_s2
 
 
 def score_candidate(
@@ -81,8 +91,10 @@ def score_candidate(
     if compute_mfe:
         mfe_result = fold_mfe(seq, params)
         mfe = mfe_result.mfe_energy / 100.0
+        mfe_struct = mfe_result.mfe_structure
     else:
         mfe = min(e1, e2)  # approximate lower bound
+        mfe_struct = ""
 
     gap1 = e1 - mfe
     gap2 = e2 - mfe
@@ -97,6 +109,7 @@ def score_candidate(
         energy_s1=e1,
         energy_s2=e2,
         mfe_energy=mfe,
+        mfe_structure=mfe_struct,
         gap_s1=gap1,
         gap_s2=gap2,
         combined_score=combined,
@@ -122,3 +135,74 @@ def score_batch(
     ]
     results.sort(key=lambda r: r.combined_score)
     return results
+
+
+def score_from_nsga2_candidate(candidate) -> CandidateResult:
+    """
+    Convert an NSGA-II Candidate to a CandidateResult.
+    
+    This allows integration between the NSGA-II output and the scoring system.
+    
+    Args:
+        candidate: A Candidate object from nsga2.py
+        
+    Returns:
+        CandidateResult with equivalent data
+    """
+    seq_str = str(candidate.sequence)
+    
+    return CandidateResult(
+        sequence=seq_str,
+        energy_s1=candidate.e_on / 100.0,
+        energy_s2=candidate.e_off / 100.0,
+        mfe_energy=candidate.mfe / 100.0,
+        mfe_structure=candidate.mfe_structure,
+        gap_s1=candidate.gap_on / 100.0,
+        gap_s2=candidate.gap_off / 100.0,
+        combined_score=(candidate.e_on + candidate.e_off + candidate.gap_on + candidate.gap_off) / 100.0,
+        pareto_rank=candidate.rank,
+        stability=(candidate.e_on + candidate.e_off) / 100.0,
+    )
+
+
+def summarize_results(results: list[CandidateResult]) -> dict:
+    """
+    Generate summary statistics for a list of scored candidates.
+    
+    Args:
+        results: List of CandidateResult objects
+        
+    Returns:
+        Dictionary with statistics
+    """
+    if not results:
+        return {"count": 0}
+    
+    gap1s = [r.gap_s1 for r in results]
+    gap2s = [r.gap_s2 for r in results]
+    stabilities = [r.stability for r in results]
+    scores = [r.combined_score for r in results]
+    
+    # Count candidates with both gaps at 0 (ideal)
+    ideal_count = sum(1 for r in results if r.gap_s1 == 0 and r.gap_s2 == 0)
+    
+    # Count Pareto-optimal (rank 0)
+    pareto_count = sum(1 for r in results if r.pareto_rank == 0)
+    
+    return {
+        "count": len(results),
+        "gap_s1_min": min(gap1s),
+        "gap_s1_max": max(gap1s),
+        "gap_s1_mean": sum(gap1s) / len(gap1s),
+        "gap_s2_min": min(gap2s),
+        "gap_s2_max": max(gap2s),
+        "gap_s2_mean": sum(gap2s) / len(gap2s),
+        "stability_min": min(stabilities),
+        "stability_max": max(stabilities),
+        "stability_mean": sum(stabilities) / len(stabilities),
+        "score_min": min(scores),
+        "score_max": max(scores),
+        "score_mean": sum(scores) / len(scores),
+        "ideal_count": ideal_count,
+        "pareto_optimal_count": pareto_count,
+    }
