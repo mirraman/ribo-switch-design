@@ -168,6 +168,7 @@ def _build_interior_init() -> np.ndarray:
     """
     init = [INF] * 31
     vals = {
+        3: 200,  # 2×1 and 1×2 loops (approx; proper impl uses int21 table)
         4: 110, 5: 200, 6: 200, 7: 210, 8: 230, 9: 240,
         10: 250, 11: 260, 12: 270, 13: 280, 14: 290, 15: 290,
         16: 300, 17: 310, 18: 310, 19: 320, 20: 330, 21: 330,
