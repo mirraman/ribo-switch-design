@@ -92,10 +92,14 @@ def evaluate_candidate(
     e_on = eval_energy(seq, s_on, params)
     e_off = eval_energy(seq, s_off, params)
     
-    # Compute MFE
+    # Compute MFE — re-score the traceback structure with eval_energy so that
+    # all three energies (e_on, e_off, mfe) use the identical energy model.
+    # This prevents gap < 0 due to minor differences between fold_mfe's
+    # internal DP energies (e.g. missing dangling ends) and eval_energy.
     fold_result = fold_mfe(seq, params)
-    mfe = fold_result.mfe_energy
     mfe_struct = fold_result.mfe_structure
+    mfe_structure_parsed = parse_dot_bracket(mfe_struct)
+    mfe = eval_energy(seq, mfe_structure_parsed, params)
     
     return Candidate(
         individual=individual,

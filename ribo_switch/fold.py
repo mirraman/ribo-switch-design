@@ -280,6 +280,11 @@ def _hairpin_energy(
     if mm == (Base.G, Base.G):
         energy += params.hairpin_gg_bonus
 
+    # Special GU closure: GU pair preceded by two Gs
+    if pair_idx == 4:  # GU
+        if i >= 2 and seq.bases[i - 1] == Base.G and seq.bases[i - 2] == Base.G:
+            energy += params.hairpin_special_gu
+
     # All-C penalty
     if all(seq.bases[k] == Base.C for k in range(i + 1, j)):
         energy += params.hairpin_c_slope * size + params.hairpin_c_intercept

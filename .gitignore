@@ -43,5 +43,5 @@ implementation_plan.md
 *.pdf
 # Keep tests directory - undo generic *tests* pattern
 !tests/
-
+*tests/**
 *.md
