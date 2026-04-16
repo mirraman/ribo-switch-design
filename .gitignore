@@ -18,6 +18,8 @@ env/
 .idea/
 *.swp
 *.swo
+settings.local.json
+.claude/
 
 # OS
 .DS_Store
