@@ -23,16 +23,18 @@ class CandidateResult:
     """Scored riboswitch candidate.
 
     Attributes:
-        sequence: RNA sequence as string.
-        energy_s1: ΔG(seq, S1) in kcal/mol.
-        energy_s2: ΔG(seq, S2) in kcal/mol.
-        mfe_energy: MFE energy of the sequence in kcal/mol.
-        mfe_structure: MFE structure in dot-bracket notation.
-        gap_s1: E(S1) - MFE — how far S1 is from optimal (0 = S1 is MFE).
-        gap_s2: E(S2) - MFE — how far S2 is from optimal.
-        combined_score: Overall quality metric (lower is better).
-        pareto_rank: Rank in Pareto front (0 = non-dominated, None if not computed).
-        stability: E(S1) + E(S2) — total structural stability.
+        sequence:        RNA sequence as string.
+        energy_s1:       ΔG(seq, S1) in kcal/mol.
+        energy_s2:       ΔG(seq, S2) in kcal/mol.
+        mfe_energy:      MFE energy of the sequence in kcal/mol.
+        mfe_structure:   MFE structure in dot-bracket notation.
+        gap_s1:          E(S1) - MFE (0 means S1 is the MFE structure).
+        gap_s2:          E(S2) - MFE.
+        combined_score:  Overall quality metric (lower is better).
+        pareto_rank:     Rank in Pareto front (0 = non-dominated, None if not set).
+        stability:       E(S1) + E(S2) in kcal/mol.
+        switching_score: Two-state Boltzmann P(S_ON) in {S_ON, S_OFF} ∈ (0,1);
+                         None if not computed.
     """
     sequence: str
     energy_s1: float
@@ -44,7 +46,8 @@ class CandidateResult:
     combined_score: float
     pareto_rank: Optional[int] = None
     stability: float = 0.0
-    
+    switching_score: Optional[float] = None
+
     def __post_init__(self):
         self.stability = self.energy_s1 + self.energy_s2
 
@@ -162,6 +165,7 @@ def score_from_nsga2_candidate(candidate) -> CandidateResult:
         combined_score=(candidate.e_on + candidate.e_off + candidate.gap_on + candidate.gap_off) / 100.0,
         pareto_rank=candidate.rank,
         stability=(candidate.e_on + candidate.e_off) / 100.0,
+        switching_score=candidate.switching_score,
     )
 
 

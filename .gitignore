@@ -43,7 +43,6 @@ output.out
 implementation_plan.md
 *.txt
 *.pdf
-# Keep tests directory - undo generic *tests* pattern
-!tests/
-*tests/**
+
 *.md
+tests/

@@ -3,12 +3,17 @@ nsga2.py — Multi-objective evolutionary engine using NSGA-II.
 
 Implements Non-dominated Sorting Genetic Algorithm II (Deb et al., 2002)
 for riboswitch inverse design. Returns a Pareto front of candidate sequences
-with varying tradeoffs between ON-state and OFF-state stability.
+with varying tradeoffs between ON-state and OFF-state conformational switching.
 
 Objectives (all minimized):
-    - Gap_ON:   E(seq, S_ON) - MFE(seq)    -- how far S_ON is from MFE
-    - Gap_OFF:  E(seq, S_OFF) - MFE(seq)   -- how far S_OFF is from MFE
-    - Stability: E(seq, S_ON) + E(seq, S_OFF)  -- prefer structured sequences
+    - Gap_ON:          E(seq, S_ON)  - MFE(seq) ≥ 0  — how far S_ON is from MFE
+    - Gap_OFF:         E(seq, S_OFF) - MFE(seq) ≥ 0  — how far S_OFF is from MFE
+    - -switching_score: two-state Boltzmann probability of S_ON vs S_OFF
+
+switching_score = sigmoid((E_OFF − E_ON) / kT) ∈ (0, 1).
+> 0.5 means the molecule thermodynamically prefers S_ON over S_OFF.
+This replaces the McCaskill p_on/p_off which collapse to ≈ 0 for sequences
+longer than ~20 nt and provide no useful gradient signal.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from ribo_switch.graph import ConstraintGraph, build_constraint_graph, verify_bi
 from ribo_switch.genetics import Individual, create_individual, crossover, mutate
 from ribo_switch.energy import eval_energy
 from ribo_switch.fold import fold_mfe, FoldResult
+from ribo_switch.brpf import two_state_score, kT_at
 from ribo_switch.turner import TurnerParams
 
 
@@ -29,43 +35,45 @@ from ribo_switch.turner import TurnerParams
 class Candidate:
     """
     A riboswitch candidate with computed objective values.
-    
+
     Attributes:
-        individual: The underlying Individual from genetics.py
-        e_on: Energy of sequence in ON structure
-        e_off: Energy of sequence in OFF structure
-        mfe: Minimum free energy of sequence (any structure)
-        mfe_structure: The MFE structure in dot-bracket notation
-        gap_on: E_ON - MFE (how far ON is from optimal)
-        gap_off: E_OFF - MFE (how far OFF is from optimal)
-        stability: E_ON + E_OFF (lower = more stable)
-        rank: Pareto rank (0 = non-dominated)
-        crowding_distance: Diversity measure within Pareto front
+        individual:      The underlying Individual from genetics.py.
+        e_on:            Energy of sequence in ON structure (0.01 kcal/mol).
+        e_off:           Energy of sequence in OFF structure (0.01 kcal/mol).
+        mfe:             MFE re-evaluated with eval_energy (0.01 kcal/mol).
+        mfe_structure:   MFE structure in dot-bracket notation.
+        switching_score: Two-state Boltzmann P(S_ON) in {S_ON, S_OFF} ∈ (0, 1).
+        gap_on:          E_ON - MFE (≥ 0; how far S_ON is from the MFE).
+        gap_off:         E_OFF - MFE (≥ 0; how far S_OFF is from the MFE).
+        stability:       E_ON + E_OFF (kept for display/summary; not an objective).
+        rank:            Pareto rank (0 = non-dominated).
+        crowding_distance: Diversity measure within a Pareto front.
     """
     individual: Individual
     e_on: Energy
     e_off: Energy
     mfe: Energy
     mfe_structure: str
+    switching_score: float
     gap_on: int = field(init=False)
     gap_off: int = field(init=False)
     stability: int = field(init=False)
     rank: int = 0
     crowding_distance: float = 0.0
-    
+
     def __post_init__(self):
         self.gap_on = self.e_on - self.mfe
         self.gap_off = self.e_off - self.mfe
         self.stability = self.e_on + self.e_off
-    
+
     @property
     def sequence(self) -> Sequence:
         return self.individual.sequence
-    
+
     @property
-    def objectives(self) -> tuple[int, int, int]:
-        """Return tuple of objectives (all to be minimized)."""
-        return (self.gap_on, self.gap_off, self.stability)
+    def objectives(self) -> tuple:
+        """Objectives tuple (all minimized): gap_on, gap_off, -switching_score."""
+        return (self.gap_on, self.gap_off, -self.switching_score)
 
 
 def evaluate_candidate(
@@ -87,11 +95,11 @@ def evaluate_candidate(
         Candidate with all energy values computed
     """
     seq = individual.sequence
-    
+
     # Compute energies for both target structures
     e_on = eval_energy(seq, s_on, params)
     e_off = eval_energy(seq, s_off, params)
-    
+
     # Compute MFE — re-score the traceback structure with eval_energy so that
     # all three energies (e_on, e_off, mfe) use the identical energy model.
     # This prevents gap < 0 due to minor differences between fold_mfe's
@@ -100,13 +108,20 @@ def evaluate_candidate(
     mfe_struct = fold_result.mfe_structure
     mfe_structure_parsed = parse_dot_bracket(mfe_struct)
     mfe = eval_energy(seq, mfe_structure_parsed, params)
-    
+
+    # Two-state switching score: Boltzmann P(S_ON) restricted to {S_ON, S_OFF}.
+    # This replaces the McCaskill p_on/p_off which collapse to ≈ 0 for
+    # sequences longer than ~20 nt and provide no useful gradient.
+    kT = kT_at(37.0)
+    score = two_state_score(e_on, e_off, kT)
+
     return Candidate(
         individual=individual,
         e_on=e_on,
         e_off=e_off,
         mfe=mfe,
         mfe_structure=mfe_struct,
+        switching_score=score,
     )
 
 
@@ -213,7 +228,7 @@ def crowding_distance(front: list[Candidate]) -> None:
         c.crowding_distance = 0.0
     
     # For each objective
-    num_objectives = 3
+    num_objectives = len(front[0].objectives)
     for m in range(num_objectives):
         # Sort by this objective
         front.sort(key=lambda c: c.objectives[m])
@@ -439,20 +454,24 @@ def summarize_pareto_front(front: list[Candidate]) -> dict:
     if not front:
         return {"count": 0}
     
-    gap_ons = [c.gap_on for c in front]
-    gap_offs = [c.gap_off for c in front]
-    stabilities = [c.stability for c in front]
-    
+    gap_ons     = [c.gap_on          for c in front]
+    gap_offs    = [c.gap_off         for c in front]
+    stabilities = [c.stability       for c in front]
+    scores      = [c.switching_score for c in front]
+
     return {
         "count": len(front),
-        "gap_on_min": min(gap_ons),
-        "gap_on_max": max(gap_ons),
-        "gap_on_mean": sum(gap_ons) / len(gap_ons),
-        "gap_off_min": min(gap_offs),
-        "gap_off_max": max(gap_offs),
+        "gap_on_min":  min(gap_ons),
+        "gap_on_max":  max(gap_ons),
+        "gap_on_mean": sum(gap_ons)  / len(gap_ons),
+        "gap_off_min":  min(gap_offs),
+        "gap_off_max":  max(gap_offs),
         "gap_off_mean": sum(gap_offs) / len(gap_offs),
-        "stability_min": min(stabilities),
-        "stability_max": max(stabilities),
+        "stability_min":  min(stabilities),
+        "stability_max":  max(stabilities),
         "stability_mean": sum(stabilities) / len(stabilities),
+        "switching_score_max":  max(scores),
+        "switching_score_mean": sum(scores) / len(scores),
+        "switching_score_min":  min(scores),
         "ideal_count": sum(1 for c in front if c.gap_on == 0 and c.gap_off == 0),
     }
