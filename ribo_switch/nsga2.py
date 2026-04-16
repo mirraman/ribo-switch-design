@@ -25,8 +25,8 @@ from ribo_switch.types import Base, Energy, Sequence, Structure
 from ribo_switch.structure import parse_dot_bracket
 from ribo_switch.graph import ConstraintGraph, build_constraint_graph, verify_bicompatible
 from ribo_switch.genetics import Individual, create_individual, crossover, mutate
-from ribo_switch.energy import eval_energy
-from ribo_switch.fold import fold_mfe, FoldResult
+from ribo_switch.rust_bridge import eval_energy, fold_mfe
+from ribo_switch.fold import FoldResult
 from ribo_switch.brpf import two_state_score, kT_at
 from ribo_switch.turner import TurnerParams
 
@@ -62,8 +62,11 @@ class Candidate:
     crowding_distance: float = 0.0
 
     def __post_init__(self):
-        self.gap_on = self.e_on - self.mfe
-        self.gap_off = self.e_off - self.mfe
+        # Clamp to 0: fold_mfe's DP model excludes some external energy terms
+        # that eval_energy includes. When S_ON/S_OFF happen to be the MFE, the
+        # re-evaluated mfe energy may be slightly above e_on/e_off.
+        self.gap_on = max(0, self.e_on - self.mfe)
+        self.gap_off = max(0, self.e_off - self.mfe)
         self.stability = self.e_on + self.e_off
 
     @property

@@ -30,9 +30,11 @@ Thumbs.db
 htmlcov/
 .coverage
 
-# Rust (future)
+# Rust
 target/
 Cargo.lock
+*.pyd
+*.pdb
 
 # Data outputs
 results/
