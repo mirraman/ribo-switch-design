@@ -225,7 +225,8 @@ fn multiloop_energy(
     i: usize, j: usize,
     children: &[(usize, usize)],
 ) -> i32 {
-    let nb = children.len() as i32;
+    // Closing pair counts as a helix (Turner convention), so total helices = children + 1.
+    let nb = (children.len() as i32) + 1;
 
     // Count unpaired bases inside multiloop
     let mut n_unpaired = 0i32;
@@ -252,40 +253,25 @@ fn multiloop_energy(
 
 fn external_energy(
     seq: &[u8],
-    pair_table: &[i32],
+    _pair_table: &[i32],
     top_pairs: &[(usize, usize)],
     n: usize,
 ) -> i32 {
-    // Build set of unpaired positions at the external level
+    // ViennaRNA `-d2`-style: each external pair unconditionally contributes
+    // a 5' and 3' dangle when the adjacent position exists. Matches the
+    // external-loop DP in fold.rs.
     let mut energy = 0i32;
-
-    // Collect external-level unpaired positions
-    let mut ext_unpaired = std::collections::HashSet::new();
-    let mut pos = 0usize;
-    while pos < n {
-        let j = pair_table[pos];
-        if j > pos as i32 {
-            pos = j as usize + 1;
-        } else {
-            ext_unpaired.insert(pos);
-            pos += 1;
-        }
-    }
-
     for &(i, j) in top_pairs {
         let pi = match pair_index(seq[i], seq[j]) { Some(x) => x, None => continue };
         if is_au_gu(pi) {
             energy += TERMINAL_AU_PENALTY;
         }
-        // 5' dangling end
-        if i > 0 && ext_unpaired.contains(&(i - 1)) {
+        if i > 0 {
             energy += DANGLE5[pi][seq[i - 1] as usize];
         }
-        // 3' dangling end
-        if j + 1 < n && ext_unpaired.contains(&(j + 1)) {
+        if j + 1 < n {
             energy += DANGLE3[pi][seq[j + 1] as usize];
         }
     }
-
     energy
 }

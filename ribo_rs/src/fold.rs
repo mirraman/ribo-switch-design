@@ -14,37 +14,30 @@ pub fn fold_mfe(seq: &[u8]) -> (i32, String) {
         return (0, ".".repeat(n));
     }
 
-    // DP tables: v[i][j], w[i][j], wm[i][j] — flattened row-major
-    let mut v  = vec![INF64;   n * n];
-    let mut w  = vec![0i64;    n * n];
-    let mut wm = vec![INF64;   n * n];
+    // V, WM — O(n²); f5 — 1D external-loop DP
+    let mut v  = vec![INF64; n * n];
+    let mut wm = vec![INF64; n * n];
 
     macro_rules! V  { ($i:expr,$j:expr) => { v [$i*n+$j] } }
-    macro_rules! W  { ($i:expr,$j:expr) => { w [$i*n+$j] } }
     macro_rules! WM { ($i:expr,$j:expr) => { wm[$i*n+$j] } }
 
     for span in (MIN_HAIRPIN + 2)..=n {
         for i in 0..=(n - span) {
             let j = i + span - 1;
 
-            // ── V[i][j] ──────────────────────────────────────────────────────
             if can_pair(seq, i, j) {
                 V!(i, j) = fill_v(seq, &v, &wm, i, j, n);
             }
-
-            // ── WM[i][j] ─────────────────────────────────────────────────────
             WM!(i, j) = fill_wm(seq, &v, &wm, i, j, n);
-
-            // ── W[i][j] ──────────────────────────────────────────────────────
-            W!(i, j) = fill_w(&v, &w, i, j, n);
         }
     }
 
-    let mfe = W!(0, n - 1) as i32;
+    // External-loop DP (-d2 dangles, matches external_energy in energy.rs)
+    let f5 = fill_f5(seq, &v, n);
+    let mfe = f5[n] as i32;
 
-    // Traceback
     let mut pairs = vec![-1i32; n];
-    trace_w(seq, &v, &w, &wm, 0, n - 1, n, &mut pairs);
+    trace_f5(seq, &v, &wm, &f5, n, &mut pairs);
 
     let mut db = vec![b'.'; n];
     for i in 0..n {
@@ -53,9 +46,35 @@ pub fn fold_mfe(seq: &[u8]) -> (i32, String) {
             db[pairs[i] as usize] = b')';
         }
     }
-    let structure = String::from_utf8(db).unwrap();
+    (mfe, String::from_utf8(db).unwrap())
+}
 
-    (mfe, structure)
+fn fill_f5(seq: &[u8], v: &[i64], n: usize) -> Vec<i64> {
+    // f5[i] = MFE of seq[0..i] at external level.
+    // f5[i] = min(
+    //   f5[i-1],                                   // seq[i-1] unpaired
+    //   f5[k] + V[k][i-1] + AU + d5(seq[k-1])[k>0] + d3(seq[i])[i<n]
+    //     for each valid external pair (k, i-1)
+    // )
+    let mut f5 = vec![0i64; n + 1];
+    for i in 1..=n {
+        let mut best = f5[i - 1];
+        for k in 0..i {
+            if i - 1 - k < MIN_HAIRPIN + 1 { continue; }
+            let v_ki = v[k * n + (i - 1)];
+            if v_ki >= INF64 { continue; }
+            let pi = match pair_index(seq[k], seq[i - 1]) {
+                Some(x) => x, None => continue,
+            };
+            let mut e = f5[k] + v_ki;
+            if is_au_gu(pi) { e += TERMINAL_AU_PENALTY as i64; }
+            if k > 0 { e += DANGLE5[pi][seq[k - 1] as usize] as i64; }
+            if i < n { e += DANGLE3[pi][seq[i] as usize] as i64; }
+            if e < best { best = e; }
+        }
+        f5[i] = best;
+    }
+    f5
 }
 
 // ─── DP fill functions ────────────────────────────────────────────────────────
@@ -151,73 +170,48 @@ fn fill_wm(seq: &[u8], v: &[i64], wm: &[i64], i: usize, j: usize, n: usize) -> i
     best
 }
 
-fn fill_w(v: &[i64], w: &[i64], i: usize, j: usize, n: usize) -> i64 {
-    let mut best = 0i64;
-
-    // (i,j) paired
-    let vi = v[i * n + j];
-    if vi < INF64 && vi < best { best = vi; }
-
-    // i unpaired
-    if i + 1 <= j {
-        let e = w[(i + 1) * n + j];
-        if e < best { best = e; }
-    }
-    // j unpaired
-    if j >= 1 {
-        let e = w[i * n + j - 1];
-        if e < best { best = e; }
-    }
-    // bifurcation
-    for k in i + 1..j {
-        let e = w[i * n + k] + w[(k + 1) * n + j];
-        if e < best { best = e; }
-    }
-
-    best
-}
-
 // ─── Traceback ────────────────────────────────────────────────────────────────
 
-fn trace_w(
-    seq: &[u8], v: &[i64], w: &[i64], wm: &[i64],
-    i: usize, j: usize, n: usize,
-    pairs: &mut Vec<i32>,
+fn trace_f5(
+    seq: &[u8], v: &[i64], wm: &[i64], f5: &[i64],
+    n: usize, pairs: &mut Vec<i32>,
 ) {
-    if i >= j { return; }
-    let target = w[i * n + j];
-    if target == 0 { return; }
-
-    // Check V[i][j]
-    let vi = v[i * n + j];
-    if vi < INF64 && vi == target {
-        pairs[i] = j as i32;
-        pairs[j] = i as i32;
-        trace_v(seq, v, w, wm, i, j, n, pairs);
-        return;
-    }
-    // i unpaired
-    if i + 1 <= j && w[(i + 1) * n + j] == target {
-        trace_w(seq, v, w, wm, i + 1, j, n, pairs);
-        return;
-    }
-    // j unpaired
-    if j >= 1 && w[i * n + j - 1] == target {
-        trace_w(seq, v, w, wm, i, j - 1, n, pairs);
-        return;
-    }
-    // bifurcation
-    for k in i + 1..j {
-        if w[i * n + k] + w[(k + 1) * n + j] == target {
-            trace_w(seq, v, w, wm, i, k, n, pairs);
-            trace_w(seq, v, w, wm, k + 1, j, n, pairs);
-            return;
+    let mut i = n;
+    while i > 0 {
+        if f5[i] == f5[i - 1] {
+            i -= 1;
+            continue;
+        }
+        let mut matched = false;
+        for k in 0..i {
+            if i - 1 - k < MIN_HAIRPIN + 1 { continue; }
+            let v_ki = v[k * n + (i - 1)];
+            if v_ki >= INF64 { continue; }
+            let pi = match pair_index(seq[k], seq[i - 1]) {
+                Some(x) => x, None => continue,
+            };
+            let mut e = f5[k] + v_ki;
+            if is_au_gu(pi) { e += TERMINAL_AU_PENALTY as i64; }
+            if k > 0 { e += DANGLE5[pi][seq[k - 1] as usize] as i64; }
+            if i < n { e += DANGLE3[pi][seq[i] as usize] as i64; }
+            if e == f5[i] {
+                pairs[k] = (i - 1) as i32;
+                pairs[i - 1] = k as i32;
+                trace_v(seq, v, wm, k, i - 1, n, pairs);
+                i = k;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            // Defensive: DP inconsistency — advance to avoid infinite loop.
+            i -= 1;
         }
     }
 }
 
 fn trace_v(
-    seq: &[u8], v: &[i64], w: &[i64], wm: &[i64],
+    seq: &[u8], v: &[i64], wm: &[i64],
     i: usize, j: usize, n: usize,
     pairs: &mut Vec<i32>,
 ) {
@@ -250,7 +244,7 @@ fn trace_v(
             if e == target {
                 pairs[p] = q as i32;
                 pairs[q] = p as i32;
-                trace_v(seq, v, w, wm, p, q, n, pairs);
+                trace_v(seq, v, wm, p, q, n, pairs);
                 return;
             }
         }
@@ -264,8 +258,8 @@ fn trace_v(
             let wml = wm[(i + 1) * n + k];
             let wmr = wm[(k + 1) * n + j - 1];
             if wml < INF64 && wmr < INF64 && ml_base + wml + wmr == target {
-                trace_wm(seq, v, w, wm, i + 1, k, n, pairs);
-                trace_wm(seq, v, w, wm, k + 1, j - 1, n, pairs);
+                trace_wm(seq, v, wm, i + 1, k, n, pairs);
+                trace_wm(seq, v, wm, k + 1, j - 1, n, pairs);
                 return;
             }
         }
@@ -273,7 +267,7 @@ fn trace_v(
 }
 
 fn trace_wm(
-    seq: &[u8], v: &[i64], w: &[i64], wm: &[i64],
+    seq: &[u8], v: &[i64], wm: &[i64],
     i: usize, j: usize, n: usize,
     pairs: &mut Vec<i32>,
 ) {
@@ -291,7 +285,7 @@ fn trace_wm(
             if e == target {
                 pairs[i] = j as i32;
                 pairs[j] = i as i32;
-                trace_v(seq, v, w, wm, i, j, n, pairs);
+                trace_v(seq, v, wm, i, j, n, pairs);
                 return;
             }
         }
@@ -300,7 +294,7 @@ fn trace_wm(
     if i + 1 <= j {
         let e = wm[(i + 1) * n + j];
         if e < INF64 && e + ML_PER_UNPAIRED as i64 == target {
-            trace_wm(seq, v, w, wm, i + 1, j, n, pairs);
+            trace_wm(seq, v, wm, i + 1, j, n, pairs);
             return;
         }
     }
@@ -308,7 +302,7 @@ fn trace_wm(
     if j >= 1 {
         let e = wm[i * n + j - 1];
         if e < INF64 && e + ML_PER_UNPAIRED as i64 == target {
-            trace_wm(seq, v, w, wm, i, j - 1, n, pairs);
+            trace_wm(seq, v, wm, i, j - 1, n, pairs);
             return;
         }
     }
@@ -317,8 +311,8 @@ fn trace_wm(
         let el = wm[i * n + k];
         let er = wm[(k + 1) * n + j];
         if el < INF64 && er < INF64 && el + er == target {
-            trace_wm(seq, v, w, wm, i, k, n, pairs);
-            trace_wm(seq, v, w, wm, k + 1, j, n, pairs);
+            trace_wm(seq, v, wm, i, k, n, pairs);
+            trace_wm(seq, v, wm, k + 1, j, n, pairs);
             return;
         }
     }

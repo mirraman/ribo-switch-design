@@ -304,13 +304,17 @@ def multiloop_energy(
 ) -> Energy:
     """Energy of a multiloop.
 
-    E = offset + per_branch × n_branches + per_unpaired × n_unpaired
-        + dangling end contributions
+    Turner convention: the closing pair counts as a helix, so total helices =
+    len(branches) + 1. The MFE DP charges one `ml_per_branch` for the closing
+    pair plus one per inner branch — this must match or the fold/eval models
+    diverge (previously a 40-unit-per-multiloop underestimate here).
+
+    E = offset + per_branch × (n_branches + 1) + per_unpaired × n_unpaired
         + terminal AU/GU penalties
     """
     n_branches = len(branches)
     energy = (params.ml_offset
-              + params.ml_per_branch * n_branches
+              + params.ml_per_branch * (n_branches + 1)
               + params.ml_per_unpaired * n_unpaired)
 
     # Terminal AU/GU penalty for closing pair
@@ -334,9 +338,14 @@ def external_energy(
 ) -> Energy:
     """Energy of the external loop (unpaired regions + dangling ends).
 
-    Only terminal AU/GU penalties for top-level pairs, plus dangling ends.
+    Uses ViennaRNA `-d2`-style dangle accounting: each external pair always
+    contributes a 5' and 3' dangle when the adjacent position exists,
+    regardless of whether that base is paired elsewhere. Adjacent external
+    pairs may therefore "share" a dangle base. This is the tractable model
+    that the O(n³) external-loop DP in fold.py optimises against.
     """
     energy = 0
+    n = len(seq)
 
     for i, j in loop.closing_pairs:
         pair_idx = _pair_index(seq, i, j)
@@ -345,13 +354,13 @@ def external_energy(
         if pair_idx in (0, 1, 4, 5):
             energy += params.terminal_au_penalty
 
-        # 5' dangling end (base before the pair, if it exists and is unpaired)
-        if i > 0 and i - 1 in loop.unpaired:
+        # 5' dangle from seq[i-1] (always added if base exists; -d2 mode)
+        if i > 0:
             d5_base = seq.bases[i - 1].value
             energy += int(params.dangle5[pair_idx][d5_base])
 
-        # 3' dangling end (base after the pair, if it exists and is unpaired)
-        if j + 1 < len(seq) and j + 1 in loop.unpaired:
+        # 3' dangle from seq[j+1] (always added if base exists; -d2 mode)
+        if j + 1 < n:
             d3_base = seq.bases[j + 1].value
             energy += int(params.dangle3[pair_idx][d3_base])
 

@@ -24,17 +24,25 @@ def test_eval_energy(seq, struct):
     return ok
 
 def test_fold_mfe(seq):
+    """Both folders must (a) return the same MFE value (reported by the DP
+    itself); (b) produce a structure whose eval_energy matches the DP's MFE
+    — the fold/eval consistency invariant we depend on in NSGA-II."""
     py_res  = py_fold_mfe(seq, params)
     rs_mfe, rs_db = ribo_rs.fold_mfe(seq_to_ints(seq))
-    # Compare structures (energy can differ slightly due to traceback tie-breaking)
     py_struct = parse_dot_bracket(py_res.mfe_structure)
     rs_struct = parse_dot_bracket(rs_db)
     py_re = py_eval_energy(seq, py_struct, params)
-    rs_re = py_eval_energy(seq, rs_struct, params)  # recompute with Python
-    ok = abs(py_re - rs_re) <= 1  # allow 0.01 kcal/mol for tie-breaking
+    rs_re = py_eval_energy(seq, rs_struct, params)
+
+    ok_val   = py_res.mfe_energy == rs_mfe
+    ok_py    = py_res.mfe_energy == py_re    # Python fold ≡ Python eval
+    ok_rs    = rs_mfe == rs_re                # Rust fold ≡ Python eval
+    ok = ok_val and ok_py and ok_rs
     if not ok:
-        print(f"  MISMATCH  py_struct={py_res.mfe_structure}  rs_struct={rs_db}")
+        print(f"  MISMATCH  py_mfe={py_res.mfe_energy}  rs_mfe={rs_mfe}")
         print(f"  py_re={py_re}  rs_re={rs_re}")
+        print(f"  py_struct={py_res.mfe_structure}")
+        print(f"  rs_struct={rs_db}")
     return ok
 
 print("=== Correctness check ===")

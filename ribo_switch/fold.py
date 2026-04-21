@@ -20,8 +20,8 @@ class FoldResult:
     """Result of MFE folding."""
     mfe_energy: Energy       # MFE in 0.01 kcal/mol
     mfe_structure: str       # dot-bracket notation
-    v: np.ndarray            # V[i][j] table (paired)
-    w: np.ndarray            # W[i][j] table (optimal subsequence)
+    v: np.ndarray            # V[i][j] table (paired subproblem)
+    w: np.ndarray            # f5[0..n] external-loop DP (1D, repurposed)
 
 
 # Minimum hairpin loop size
@@ -31,50 +31,79 @@ MIN_HAIRPIN = 3
 def fold_mfe(seq: Sequence, params: TurnerParams) -> FoldResult:
     """Compute the MFE structure for a sequence.
 
-    Uses three DP tables:
-      V[i][j] — min energy assuming (i,j) form a base pair
-      W[i][j] — min energy of subsequence i..j
-      WM[i][j] — min energy of a multiloop segment i..j
+    DP tables:
+      V[i][j]   — min energy assuming (i,j) form a base pair
+      WM[i][j]  — min energy of a multiloop segment i..j
+      f5[i]     — min energy of external loop over seq[0..i]
 
-    Args:
-        seq: RNA sequence.
-        params: Turner 2004 parameters.
-
-    Returns:
-        FoldResult with MFE energy and structure.
+    The f5 external DP adds a terminal AU penalty and unconditional 5'/3'
+    dangles (ViennaRNA -d2 mode) for each external-level pair, matching the
+    accounting in energy.external_energy exactly.
     """
     n = len(seq)
     v = np.full((n, n), INF, dtype=np.int64)
-    w = np.full((n, n), 0, dtype=np.int64)
     wm = np.full((n, n), INF, dtype=np.int64)
 
-    # Fill DP tables bottom-up: increasing span length
-    for span in range(MIN_HAIRPIN + 2, n + 1):  # +2 for closing pair
+    # Fill V and WM bottom-up by span length
+    for span in range(MIN_HAIRPIN + 2, n + 1):
         for i in range(n - span + 1):
             j = i + span - 1
-
-            # ── V[i][j]: energy assuming (i,j) paired ──
             if _can_pair(seq, i, j):
                 v[i][j] = _fill_v(seq, params, v, wm, i, j)
-
-            # ── WM[i][j]: multiloop segment ──
             wm[i][j] = _fill_wm(seq, params, v, wm, i, j)
 
-            # ── W[i][j]: optimal subsequence ──
-            w[i][j] = _fill_w(v, w, i, j)
+    # External-loop DP
+    f5 = _fill_f5(seq, params, v, n)
+    mfe = int(f5[n])
 
-    # MFE is W[0][n-1]
-    mfe = int(w[0][n - 1])
-
-    # Traceback
-    structure = _traceback(seq, params, v, w, wm, n)
+    structure = _traceback(seq, params, v, f5, wm, n)
 
     return FoldResult(
         mfe_energy=mfe,
         mfe_structure=structure,
         v=v,
-        w=w,
+        w=f5,
     )
+
+
+def _fill_f5(
+    seq: Sequence, params: TurnerParams, v: np.ndarray, n: int,
+) -> np.ndarray:
+    """Compute f5[0..n] — MFE of external loop over seq[0..i].
+
+    f5[i] = min(
+        f5[i-1],                                  # seq[i-1] unpaired at external level
+        for each k < i with (k, i-1) canonical:
+            f5[k] + V[k][i-1] + AU + d5(seq[k-1]) [if k>0] + d3(seq[i]) [if i<n]
+    )
+
+    Dangles are always added when adjacent positions exist (-d2 mode). This
+    matches energy.external_energy so fold_mfe and eval_energy optimise and
+    score the identical free-energy model.
+    """
+    f5 = np.zeros(n + 1, dtype=np.int64)
+    for i in range(1, n + 1):
+        best = int(f5[i - 1])  # seq[i-1] unpaired
+        # External pair (k, i-1)
+        for k in range(0, i):
+            if i - 1 - k < MIN_HAIRPIN + 1:  # need at least MIN_HAIRPIN unpaired
+                continue
+            if not _can_pair(seq, k, i - 1):
+                continue
+            if v[k][i - 1] >= INF:
+                continue
+            pi = _pair_index(seq, k, i - 1)
+            e = int(f5[k]) + int(v[k][i - 1])
+            if pi in (0, 1, 4, 5):
+                e += params.terminal_au_penalty
+            if k > 0:
+                e += int(params.dangle5[pi][seq.bases[k - 1].value])
+            if i < n:
+                e += int(params.dangle3[pi][seq.bases[i].value])
+            if e < best:
+                best = e
+        f5[i] = best
+    return f5
 
 
 def _can_pair(seq: Sequence, i: int, j: int) -> bool:
@@ -200,37 +229,6 @@ def _fill_wm(
 
     return best
 
-
-def _fill_w(v: np.ndarray, w: np.ndarray, i: int, j: int) -> int:
-    """Compute W[i][j] — optimal energy of subsequence i..j.
-
-    W[i][j] = min {
-        0,                        // all unpaired
-        V[i][j],                  // (i,j) paired
-        W[i+1][j],                // i unpaired
-        W[i][j-1],                // j unpaired
-        min over k: W[i][k] + W[k+1][j]  // bifurcation
-    }
-    """
-    best = 0  # all unpaired baseline
-
-    # (i,j) paired
-    if v[i][j] < INF:
-        best = min(best, int(v[i][j]))
-
-    # i unpaired
-    if i + 1 <= j:
-        best = min(best, int(w[i + 1][j]))
-
-    # j unpaired
-    if i <= j - 1:
-        best = min(best, int(w[i][j - 1]))
-
-    # bifurcation
-    for k in range(i + 1, j):
-        best = min(best, int(w[i][k]) + int(w[k + 1][j]))
-
-    return best
 
 def _hairpin_energy(
     seq: Sequence, params: TurnerParams,
@@ -361,14 +359,13 @@ def _interior_e(
 
 def _traceback(
     seq: Sequence, params: TurnerParams,
-    v: np.ndarray, w: np.ndarray, wm: np.ndarray,
+    v: np.ndarray, f5: np.ndarray, wm: np.ndarray,
     n: int,
 ) -> str:
-    """Reconstruct MFE structure from DP tables."""
+    """Reconstruct MFE structure by walking f5 + V + WM."""
     pairs: list[tuple[int, int]] = []
-    _trace_w(seq, params, v, w, wm, 0, n - 1, pairs)
+    _trace_f5(seq, params, v, f5, wm, n, pairs)
 
-    # Build dot-bracket
     db = ['.'] * n
     for i, j in pairs:
         db[i] = '('
@@ -376,42 +373,43 @@ def _traceback(
     return ''.join(db)
 
 
-def _trace_w(
+def _trace_f5(
     seq: Sequence, params: TurnerParams,
-    v: np.ndarray, w: np.ndarray, wm: np.ndarray,
-    i: int, j: int,
+    v: np.ndarray, f5: np.ndarray, wm: np.ndarray,
+    n: int,
     pairs: list[tuple[int, int]],
 ) -> None:
-    """Traceback through W table."""
-    if i >= j:
-        return
-
-    target = int(w[i][j])
-    if target == 0:
-        return  # all unpaired
-
-    # Check V[i][j]
-    if v[i][j] < INF and int(v[i][j]) == target:
-        pairs.append((i, j))
-        _trace_v(seq, params, v, w, wm, i, j, pairs)
-        return
-
-    # Check W[i+1][j]
-    if i + 1 <= j and int(w[i + 1][j]) == target:
-        _trace_w(seq, params, v, w, wm, i + 1, j, pairs)
-        return
-
-    # Check W[i][j-1]
-    if i <= j - 1 and int(w[i][j - 1]) == target:
-        _trace_w(seq, params, v, w, wm, i, j - 1, pairs)
-        return
-
-    # Bifurcation
-    for k in range(i + 1, j):
-        if int(w[i][k]) + int(w[k + 1][j]) == target:
-            _trace_w(seq, params, v, w, wm, i, k, pairs)
-            _trace_w(seq, params, v, w, wm, k + 1, j, pairs)
-            return
+    """Walk f5[n] → f5[0] extracting external pairs."""
+    i = n
+    while i > 0:
+        if int(f5[i]) == int(f5[i - 1]):
+            i -= 1
+            continue
+        matched = False
+        for k in range(0, i):
+            if i - 1 - k < MIN_HAIRPIN + 1:
+                continue
+            if not _can_pair(seq, k, i - 1):
+                continue
+            if v[k][i - 1] >= INF:
+                continue
+            pi = _pair_index(seq, k, i - 1)
+            e = int(f5[k]) + int(v[k][i - 1])
+            if pi in (0, 1, 4, 5):
+                e += params.terminal_au_penalty
+            if k > 0:
+                e += int(params.dangle5[pi][seq.bases[k - 1].value])
+            if i < n:
+                e += int(params.dangle3[pi][seq.bases[i].value])
+            if e == int(f5[i]):
+                pairs.append((k, i - 1))
+                _trace_v(seq, params, v, f5, wm, k, i - 1, pairs)
+                i = k
+                matched = True
+                break
+        if not matched:
+            # Should not happen if DP is consistent; advance to avoid infinite loop
+            i -= 1
 
 
 def _trace_v(

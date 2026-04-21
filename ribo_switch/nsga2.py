@@ -62,11 +62,11 @@ class Candidate:
     crowding_distance: float = 0.0
 
     def __post_init__(self):
-        # Clamp to 0: fold_mfe's DP model excludes some external energy terms
-        # that eval_energy includes. When S_ON/S_OFF happen to be the MFE, the
-        # re-evaluated mfe energy may be slightly above e_on/e_off.
-        self.gap_on = max(0, self.e_on - self.mfe)
-        self.gap_off = max(0, self.e_off - self.mfe)
+        # fold_mfe and eval_energy now share the identical energy model
+        # (-d2 external dangles, Turner multiloop with closing-pair branch),
+        # so e_on − mfe and e_off − mfe are guaranteed ≥ 0 by construction.
+        self.gap_on = self.e_on - self.mfe
+        self.gap_off = self.e_off - self.mfe
         self.stability = self.e_on + self.e_off
 
     @property
