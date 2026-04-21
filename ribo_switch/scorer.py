@@ -14,8 +14,7 @@ from typing import Optional
 
 from ribo_switch.types import Base, Sequence, Structure
 from ribo_switch.turner import TurnerParams
-from ribo_switch.energy import eval_energy
-from ribo_switch.fold import fold_mfe
+from ribo_switch.rust_bridge import eval_energy, fold_mfe
 
 
 @dataclass
