@@ -38,6 +38,8 @@ Cargo.lock
 
 # Data outputs
 results/
+results.json
+result.json
 *.tsv
 *.csv
 output.out
