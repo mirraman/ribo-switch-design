@@ -50,3 +50,5 @@ implementation_plan.md
 
 *.md
 tests/
+
+rand_structure/

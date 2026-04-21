@@ -21,11 +21,18 @@ from dataclasses import dataclass, field
 from typing import Callable
 import random
 
+import numpy as np
+
 from ribo_switch.types import Base, Energy, Sequence, Structure
 from ribo_switch.structure import parse_dot_bracket
 from ribo_switch.graph import ConstraintGraph, build_constraint_graph, verify_bicompatible
 from ribo_switch.genetics import Individual, create_individual, crossover, mutate
-from ribo_switch.rust_bridge import eval_energy, fold_mfe
+from ribo_switch.rust_bridge import (
+    eval_energy,
+    fold_mfe,
+    evaluate_candidate as _rs_evaluate_candidate,
+    evaluate_batch as _rs_evaluate_batch,
+)
 from ribo_switch.fold import FoldResult
 from ribo_switch.brpf import two_state_score, kT_at
 from ribo_switch.turner import TurnerParams
@@ -99,22 +106,14 @@ def evaluate_candidate(
     """
     seq = individual.sequence
 
-    # Compute energies for both target structures
-    e_on = eval_energy(seq, s_on, params)
-    e_off = eval_energy(seq, s_off, params)
-
-    # Compute MFE — re-score the traceback structure with eval_energy so that
-    # all three energies (e_on, e_off, mfe) use the identical energy model.
-    # This prevents gap < 0 due to minor differences between fold_mfe's
-    # internal DP energies (e.g. missing dangling ends) and eval_energy.
-    fold_result = fold_mfe(seq, params)
-    mfe_struct = fold_result.mfe_structure
-    mfe_structure_parsed = parse_dot_bracket(mfe_struct)
-    mfe = eval_energy(seq, mfe_structure_parsed, params)
+    # One Rust call returns all three energies and the folded structure.
+    # The Rust side re-scores the folded pair-table with eval_energy so the
+    # returned `mfe` uses the identical accounting as `e_on` / `e_off`,
+    # guaranteeing `gap_on ≥ 0` and `gap_off ≥ 0`.
+    e_on, e_off, mfe, mfe_struct = _rs_evaluate_candidate(seq, s_on, s_off, params)
 
     # Two-state switching score: Boltzmann P(S_ON) restricted to {S_ON, S_OFF}.
-    # This replaces the McCaskill p_on/p_off which collapse to ≈ 0 for
-    # sequences longer than ~20 nt and provide no useful gradient.
+    # Replaces McCaskill p_on/p_off which collapse to ≈ 0 for seqs > ~20 nt.
     kT = kT_at(37.0)
     score = two_state_score(e_on, e_off, kT)
 
@@ -126,6 +125,39 @@ def evaluate_candidate(
         mfe_structure=mfe_struct,
         switching_score=score,
     )
+
+
+def evaluate_individuals_batch(
+    individuals: list[Individual],
+    s_on: Structure,
+    s_off: Structure,
+    params: TurnerParams,
+) -> list[Candidate]:
+    """Evaluate many individuals in parallel via the Rust batch API.
+
+    When the Rust extension is active, folding runs with the GIL released
+    and rayon fans out across CPU cores. With the pure-Python fallback this
+    reduces to a sequential loop (identical semantics to
+    :func:`evaluate_candidate`).
+    """
+    if not individuals:
+        return []
+
+    seqs = [ind.sequence for ind in individuals]
+    raw = _rs_evaluate_batch(seqs, s_on, s_off, params)
+    kT = kT_at(37.0)
+
+    return [
+        Candidate(
+            individual=ind,
+            e_on=e_on,
+            e_off=e_off,
+            mfe=mfe,
+            mfe_structure=mfe_db,
+            switching_score=two_state_score(e_on, e_off, kT),
+        )
+        for ind, (e_on, e_off, mfe, mfe_db) in zip(individuals, raw)
+    ]
 
 
 def dominates(a: Candidate, b: Candidate) -> bool:
@@ -148,65 +180,62 @@ def dominates(a: Candidate, b: Candidate) -> bool:
 def fast_non_dominated_sort(population: list[Candidate]) -> list[list[Candidate]]:
     """
     Sort population into Pareto fronts using fast non-dominated sorting.
-    
-    Front 0 = non-dominated (best)
-    Front 1 = dominated only by front 0
-    etc.
-    
-    Time complexity: O(M * N^2) where M = objectives, N = population size
-    
-    Args:
-        population: List of candidates to sort
-        
-    Returns:
-        List of fronts, where fronts[0] is the Pareto front
+
+    Front 0 = non-dominated (best); front k is dominated only by members of
+    fronts 0..k-1.
+
+    Numpy-vectorised: the whole ``N×N`` dominance matrix is computed in one
+    broadcast, and fronts are peeled off by decrementing each remaining
+    candidate's incoming-dominance count.
+
+    Complexity stays ``O(M·N²)`` for the dominance matrix build, but the
+    per-element cost drops to a native-loop add/compare, not a Python
+    ``dominates()`` call.
     """
     n = len(population)
     if n == 0:
         return []
-    
-    # For each candidate, track who it dominates and how many dominate it
-    domination_count = [0] * n  # number of solutions that dominate this one
-    dominated_set: list[list[int]] = [[] for _ in range(n)]  # solutions this dominates
-    
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            if dominates(population[i], population[j]):
-                dominated_set[i].append(j)
-            elif dominates(population[j], population[i]):
-                domination_count[i] += 1
-    
-    # First front: candidates with domination_count == 0
+
+    # (N, M) float objectives. Each Candidate's `objectives` property already
+    # returns the canonical minimization tuple (gap_on, gap_off, -score).
+    obj = np.asarray(
+        [c.objectives for c in population], dtype=np.float64
+    )
+
+    # dom[i, j] == True  iff  candidate i dominates candidate j
+    diff = obj[:, None, :] - obj[None, :, :]       # (N, N, M)
+    leq = np.all(diff <= 0.0, axis=2)              # (N, N) i ≤ j on every obj
+    lt  = np.any(diff <  0.0, axis=2)              # (N, N) i < j on some obj
+    dom = leq & lt
+    np.fill_diagonal(dom, False)
+
+    # domination_count[j] = # of still-remaining candidates that dominate j
+    domination_count = dom.sum(axis=0).astype(np.int32)  # (N,)
+    remaining = np.ones(n, dtype=bool)
+
     fronts: list[list[Candidate]] = []
-    current_front_indices: list[int] = []
-    
-    for i in range(n):
-        if domination_count[i] == 0:
-            population[i].rank = 0
-            current_front_indices.append(i)
-    
-    fronts.append([population[i] for i in current_front_indices])
-    
-    # Generate subsequent fronts
     front_idx = 0
-    while current_front_indices:
-        next_front_indices: list[int] = []
-        
-        for i in current_front_indices:
-            for j in dominated_set[i]:
-                domination_count[j] -= 1
-                if domination_count[j] == 0:
-                    population[j].rank = front_idx + 1
-                    next_front_indices.append(j)
-        
+    while remaining.any():
+        front_mask = remaining & (domination_count == 0)
+        if not front_mask.any():
+            # Numerical safety net: should not happen for a proper dominance
+            # relation, but drop any stragglers into a final front.
+            straggler_idx = np.where(remaining)[0]
+            for i in straggler_idx:
+                population[int(i)].rank = front_idx
+            fronts.append([population[int(i)] for i in straggler_idx])
+            break
+
+        front_indices = np.where(front_mask)[0]
+        for i in front_indices:
+            population[int(i)].rank = front_idx
+        fronts.append([population[int(i)] for i in front_indices])
+
+        # Everyone dominated by this front loses that many incoming edges.
+        domination_count -= dom[front_indices].sum(axis=0, dtype=np.int32)
+        remaining[front_indices] = False
         front_idx += 1
-        current_front_indices = next_front_indices
-        
-        if next_front_indices:
-            fronts.append([population[i] for i in next_front_indices])
-    
+
     return fronts
 
 
@@ -316,30 +345,25 @@ def evolve(
         New population of same size
     """
     pop_size = len(population)
-    offspring: list[Candidate] = []
-    
-    # Generate offspring
-    while len(offspring) < pop_size:
-        # Select parents
+
+    # Breed all offspring individuals first (cheap, pure Python), then
+    # evaluate the whole batch in one parallel Rust call.
+    child_inds: list[Individual] = []
+    while len(child_inds) < pop_size:
         parent1 = tournament_select(population, rng)
         parent2 = tournament_select(population, rng)
-        
-        # Crossover
+
         child1_ind, child2_ind = crossover(
             parent1.individual, parent2.individual, graph, rng
         )
-        
-        # Mutation
         child1_ind = mutate(child1_ind, graph, mutation_rate, rng)
         child2_ind = mutate(child2_ind, graph, mutation_rate, rng)
-        
-        # Evaluate
-        child1 = evaluate_candidate(child1_ind, s_on, s_off, params)
-        child2 = evaluate_candidate(child2_ind, s_on, s_off, params)
-        
-        offspring.append(child1)
-        if len(offspring) < pop_size:
-            offspring.append(child2)
+
+        child_inds.append(child1_ind)
+        if len(child_inds) < pop_size:
+            child_inds.append(child2_ind)
+
+    offspring = evaluate_individuals_batch(child_inds, s_on, s_off, params)
     
     # Combine parents and offspring
     combined = population + offspring
@@ -413,12 +437,11 @@ def nsga2(
     # Build constraint graph
     graph = build_constraint_graph(structure_on, structure_off)
     
-    # Initialize population
-    population: list[Candidate] = []
-    for _ in range(population_size):
-        ind = create_individual(graph, rng)
-        candidate = evaluate_candidate(ind, structure_on, structure_off, params)
-        population.append(candidate)
+    # Initialize population — breed all individuals, then evaluate as a batch.
+    initial_inds = [create_individual(graph, rng) for _ in range(population_size)]
+    population = evaluate_individuals_batch(
+        initial_inds, structure_on, structure_off, params
+    )
     
     # Initial sort
     fronts = fast_non_dominated_sort(population)

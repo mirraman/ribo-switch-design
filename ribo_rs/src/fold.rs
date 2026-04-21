@@ -8,10 +8,19 @@ use crate::params::*;
 const INF64: i64 = 10_000_000_000;
 
 pub fn fold_mfe(seq: &[u8]) -> (i32, String) {
+    let (mfe, _pairs, db) = fold_mfe_full(seq);
+    (mfe, db)
+}
+
+/// Same as [`fold_mfe`] but also returns the pair table directly.
+///
+/// Exposed so callers doing both folding and per-structure energy evaluation
+/// can skip the dot-bracket round-trip (see `eval_combined::evaluate_one`).
+pub fn fold_mfe_full(seq: &[u8]) -> (i32, Vec<i32>, String) {
     let n = seq.len();
 
     if n < MIN_HAIRPIN + 2 {
-        return (0, ".".repeat(n));
+        return (0, vec![-1; n], ".".repeat(n));
     }
 
     // V, WM — O(n²); f5 — 1D external-loop DP
@@ -46,7 +55,7 @@ pub fn fold_mfe(seq: &[u8]) -> (i32, String) {
             db[pairs[i] as usize] = b')';
         }
     }
-    (mfe, String::from_utf8(db).unwrap())
+    (mfe, pairs, String::from_utf8(db).unwrap())
 }
 
 fn fill_f5(seq: &[u8], v: &[i64], n: usize) -> Vec<i64> {
