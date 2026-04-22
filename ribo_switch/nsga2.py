@@ -36,7 +36,7 @@ class Candidate:
     switching_score: float
     s_on_pt: list[int] = field(default_factory=list, repr=False)
     s_off_pt: list[int] = field(default_factory=list, repr=False)
-    include_structure_objective: bool = True
+    include_structure_objective: bool = False
     gap_on: int = field(init=False)
     gap_off: int = field(init=False)
     stability: int = field(init=False)
@@ -74,14 +74,14 @@ class Candidate:
             return base + (self.bp_dist_on,)
         return base
 
-def evaluate_candidate(individual: Individual, s_on: Structure, s_off: Structure, params: TurnerParams, include_structure_objective: bool=True) -> Candidate:
+def evaluate_candidate(individual: Individual, s_on: Structure, s_off: Structure, params: TurnerParams, include_structure_objective: bool=False) -> Candidate:
     seq = individual.sequence
     e_on, e_off, mfe, mfe_struct = _rs_evaluate_candidate(seq, s_on, s_off, params)
     kT = kT_at(37.0)
     score = two_state_score(e_on, e_off, kT)
     return Candidate(individual=individual, e_on=e_on, e_off=e_off, mfe=mfe, mfe_structure=mfe_struct, switching_score=score, s_on_pt=s_on.pair_table, s_off_pt=s_off.pair_table, include_structure_objective=include_structure_objective)
 
-def evaluate_individuals_batch(individuals: list[Individual], s_on: Structure, s_off: Structure, params: TurnerParams, include_structure_objective: bool=True) -> list[Candidate]:
+def evaluate_individuals_batch(individuals: list[Individual], s_on: Structure, s_off: Structure, params: TurnerParams, include_structure_objective: bool=False) -> list[Candidate]:
     if not individuals:
         return []
     seqs = [ind.sequence for ind in individuals]
@@ -154,7 +154,7 @@ def tournament_select(population: list[Candidate], rng: random.Random, tournamen
         return (c.rank, -c.crowding_distance)
     return min(contestants, key=key_fn)
 
-def evolve(population: list[Candidate], graph: ConstraintGraph, s_on: Structure, s_off: Structure, params: TurnerParams, mutation_rate: float, rng: random.Random, include_structure_objective: bool=True) -> list[Candidate]:
+def evolve(population: list[Candidate], graph: ConstraintGraph, s_on: Structure, s_off: Structure, params: TurnerParams, mutation_rate: float, rng: random.Random, include_structure_objective: bool=False) -> list[Candidate]:
     pop_size = len(population)
     child_inds: list[Individual] = []
     while len(child_inds) < pop_size:
@@ -191,7 +191,7 @@ def filter_by_structure(candidates: list[Candidate], max_bp_dist_on: int=0, max_
         result = [c for c in result if c.bp_dist_off <= max_bp_dist_off]
     return result
 
-def nsga2(structure_on: str | Structure, structure_off: str | Structure, population_size: int=100, n_generations: int=200, mutation_rate: float=0.1, params: TurnerParams | None=None, seed: int | None=None, callback: Callable[[int, list[Candidate]], None] | None=None, include_structure_objective: bool=True) -> list[Candidate]:
+def nsga2(structure_on: str | Structure, structure_off: str | Structure, population_size: int=100, n_generations: int=200, mutation_rate: float=0.1, params: TurnerParams | None=None, seed: int | None=None, callback: Callable[[int, list[Candidate]], None] | None=None, include_structure_objective: bool=False) -> list[Candidate]:
     if isinstance(structure_on, str):
         structure_on = parse_dot_bracket(structure_on)
     if isinstance(structure_off, str):
