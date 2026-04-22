@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Build ribo_rs and sync the .pyd into the project-root ribo_rs/ directory.
-#
-# `maturin develop` installs the extension into the venv's site-packages, but
-# `import ribo_rs` from this repo finds the project-root `ribo_rs/` package
-# first. If the .pyd there is stale, Python loads old code silently.
-# This script copies the freshly built .pyd over to keep them in sync.
 set -euo pipefail
 
 cd "$(dirname "$0")"

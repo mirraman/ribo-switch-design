@@ -1,53 +1,31 @@
-/// fold_mfe — Zuker MFE folding algorithm in Rust.
-///
-/// Mirrors fold.py exactly. Returns (mfe_energy, dot_bracket_string).
-/// Uses i64 for DP tables to avoid overflow during accumulation.
-
 use crate::params::*;
-
 const INF64: i64 = 10_000_000_000;
-
 pub fn fold_mfe(seq: &[u8]) -> (i32, String) {
     let (mfe, _pairs, db) = fold_mfe_full(seq);
     (mfe, db)
 }
-
-/// Same as [`fold_mfe`] but also returns the pair table directly.
-///
-/// Exposed so callers doing both folding and per-structure energy evaluation
-/// can skip the dot-bracket round-trip (see `eval_combined::evaluate_one`).
 pub fn fold_mfe_full(seq: &[u8]) -> (i32, Vec<i32>, String) {
     let n = seq.len();
-
     if n < MIN_HAIRPIN + 2 {
         return (0, vec![-1; n], ".".repeat(n));
     }
-
-    // V, WM — O(n²); f5 — 1D external-loop DP
     let mut v  = vec![INF64; n * n];
     let mut wm = vec![INF64; n * n];
-
     macro_rules! V  { ($i:expr,$j:expr) => { v [$i*n+$j] } }
     macro_rules! WM { ($i:expr,$j:expr) => { wm[$i*n+$j] } }
-
     for span in (MIN_HAIRPIN + 2)..=n {
         for i in 0..=(n - span) {
             let j = i + span - 1;
-
             if can_pair(seq, i, j) {
                 V!(i, j) = fill_v(seq, &v, &wm, i, j, n);
             }
             WM!(i, j) = fill_wm(seq, &v, &wm, i, j, n);
         }
     }
-
-    // External-loop DP (-d2 dangles, matches external_energy in energy.rs)
     let f5 = fill_f5(seq, &v, n);
     let mfe = f5[n] as i32;
-
     let mut pairs = vec![-1i32; n];
     trace_f5(seq, &v, &wm, &f5, n, &mut pairs);
-
     let mut db = vec![b'.'; n];
     for i in 0..n {
         if pairs[i] > i as i32 {
@@ -57,14 +35,7 @@ pub fn fold_mfe_full(seq: &[u8]) -> (i32, Vec<i32>, String) {
     }
     (mfe, pairs, String::from_utf8(db).unwrap())
 }
-
 fn fill_f5(seq: &[u8], v: &[i64], n: usize) -> Vec<i64> {
-    // f5[i] = MFE of seq[0..i] at external level.
-    // f5[i] = min(
-    //   f5[i-1],                                   // seq[i-1] unpaired
-    //   f5[k] + V[k][i-1] + AU + d5(seq[k-1])[k>0] + d3(seq[i])[i<n]
-    //     for each valid external pair (k, i-1)
-    // )
     let mut f5 = vec![0i64; n + 1];
     for i in 1..=n {
         let mut best = f5[i - 1];
@@ -85,14 +56,9 @@ fn fill_f5(seq: &[u8], v: &[i64], n: usize) -> Vec<i64> {
     }
     f5
 }
-
-// ─── DP fill functions ────────────────────────────────────────────────────────
-
 fn fill_v(seq: &[u8], v: &[i64], wm: &[i64], i: usize, j: usize, n: usize) -> i64 {
     let pi = match pair_index(seq[i], seq[j]) { Some(x) => x, None => return INF64 };
     let mut best = hairpin64(seq, i, j, pi);
-
-    // Stack / Bulge / Interior
     let max_int = (j - i - 2).min(30);
     for p in i + 1..j {
         let nl = p - i - 1;
@@ -102,12 +68,9 @@ fn fill_v(seq: &[u8], v: &[i64], wm: &[i64], i: usize, j: usize, n: usize) -> i6
             if nl + nr > max_int { continue; }
             if !can_pair(seq, p, q) { continue; }
             if q - p - 1 < MIN_HAIRPIN { continue; }
-
             let vp = v[p * n + q];
             if vp >= INF64 { continue; }
-
             let pp = match pair_index(seq[p], seq[q]) { Some(x) => x, None => continue };
-
             let e = if nl == 0 && nr == 0 {
                 STACK[pi][pp] as i64 + vp
             } else if nl == 0 || nr == 0 {
@@ -115,12 +78,9 @@ fn fill_v(seq: &[u8], v: &[i64], wm: &[i64], i: usize, j: usize, n: usize) -> i6
             } else {
                 interior64(seq, i, j, p, q, pi, pp, nl, nr) + vp
             };
-
             if e < best { best = e; }
         }
     }
-
-    // Multiloop
     if j - i - 1 >= 2 * (MIN_HAIRPIN + 2) {
         let mut ml_base = (ML_OFFSET + ML_PER_BRANCH) as i64;
         if is_au_gu(pi) { ml_base += TERMINAL_AU_PENALTY as i64; }
@@ -133,14 +93,10 @@ fn fill_v(seq: &[u8], v: &[i64], wm: &[i64], i: usize, j: usize, n: usize) -> i6
             }
         }
     }
-
     best
 }
-
 fn fill_wm(seq: &[u8], v: &[i64], wm: &[i64], i: usize, j: usize, n: usize) -> i64 {
     let mut best = INF64;
-
-    // Case 1: (i,j) branch
     if can_pair(seq, i, j) {
         let vi = v[i * n + j];
         if vi < INF64 {
@@ -150,7 +106,6 @@ fn fill_wm(seq: &[u8], v: &[i64], wm: &[i64], i: usize, j: usize, n: usize) -> i
             if e < best { best = e; }
         }
     }
-    // Case 2: i unpaired
     if i + 1 <= j {
         let e = wm[(i + 1) * n + j];
         if e < INF64 {
@@ -158,7 +113,6 @@ fn fill_wm(seq: &[u8], v: &[i64], wm: &[i64], i: usize, j: usize, n: usize) -> i
             if e2 < best { best = e2; }
         }
     }
-    // Case 3: j unpaired
     if j >= 1 {
         let e = wm[i * n + j - 1];
         if e < INF64 {
@@ -166,7 +120,6 @@ fn fill_wm(seq: &[u8], v: &[i64], wm: &[i64], i: usize, j: usize, n: usize) -> i
             if e2 < best { best = e2; }
         }
     }
-    // Case 4: bifurcation
     for k in i + 1..j {
         let el = wm[i * n + k];
         let er = wm[(k + 1) * n + j];
@@ -175,12 +128,8 @@ fn fill_wm(seq: &[u8], v: &[i64], wm: &[i64], i: usize, j: usize, n: usize) -> i
             if e < best { best = e; }
         }
     }
-
     best
 }
-
-// ─── Traceback ────────────────────────────────────────────────────────────────
-
 fn trace_f5(
     seq: &[u8], v: &[i64], wm: &[i64], f5: &[i64],
     n: usize, pairs: &mut Vec<i32>,
@@ -213,12 +162,10 @@ fn trace_f5(
             }
         }
         if !matched {
-            // Defensive: DP inconsistency — advance to avoid infinite loop.
             i -= 1;
         }
     }
 }
-
 fn trace_v(
     seq: &[u8], v: &[i64], wm: &[i64],
     i: usize, j: usize, n: usize,
@@ -226,11 +173,7 @@ fn trace_v(
 ) {
     let target = v[i * n + j];
     let pi = match pair_index(seq[i], seq[j]) { Some(x) => x, None => return };
-
-    // Hairpin?
     if hairpin64(seq, i, j, pi) == target { return; }
-
-    // Stack / Bulge / Interior?
     let max_int = (j - i - 2).min(30);
     for p in i + 1..j {
         let nl = p - i - 1;
@@ -258,8 +201,6 @@ fn trace_v(
             }
         }
     }
-
-    // Multiloop?
     if j - i - 1 >= 2 * (MIN_HAIRPIN + 2) {
         let mut ml_base = (ML_OFFSET + ML_PER_BRANCH) as i64;
         if is_au_gu(pi) { ml_base += TERMINAL_AU_PENALTY as i64; }
@@ -274,7 +215,6 @@ fn trace_v(
         }
     }
 }
-
 fn trace_wm(
     seq: &[u8], v: &[i64], wm: &[i64],
     i: usize, j: usize, n: usize,
@@ -283,8 +223,6 @@ fn trace_wm(
     if i > j { return; }
     let target = wm[i * n + j];
     if target >= INF64 { return; }
-
-    // Branch
     if can_pair(seq, i, j) {
         let vi = v[i * n + j];
         if vi < INF64 {
@@ -299,7 +237,6 @@ fn trace_wm(
             }
         }
     }
-    // i unpaired
     if i + 1 <= j {
         let e = wm[(i + 1) * n + j];
         if e < INF64 && e + ML_PER_UNPAIRED as i64 == target {
@@ -307,7 +244,6 @@ fn trace_wm(
             return;
         }
     }
-    // j unpaired
     if j >= 1 {
         let e = wm[i * n + j - 1];
         if e < INF64 && e + ML_PER_UNPAIRED as i64 == target {
@@ -315,7 +251,6 @@ fn trace_wm(
             return;
         }
     }
-    // bifurcation
     for k in i + 1..j {
         let el = wm[i * n + k];
         let er = wm[(k + 1) * n + j];
@@ -326,31 +261,24 @@ fn trace_wm(
         }
     }
 }
-
-// ─── Shared helpers ───────────────────────────────────────────────────────────
-
 #[inline]
 fn can_pair(seq: &[u8], i: usize, j: usize) -> bool {
     pair_index(seq[i], seq[j]).is_some()
 }
-
 #[inline]
 fn hairpin64(seq: &[u8], i: usize, j: usize, pi: usize) -> i64 {
     let e = hairpin_e(seq, i, j, pi);
     if e >= INF { INF64 } else { e as i64 }
 }
-
 fn hairpin_e(seq: &[u8], i: usize, j: usize, pi: usize) -> i32 {
     let size = j - i - 1;
     if size < MIN_HAIRPIN { return INF; }
-
     let mut energy = if size <= 30 {
         HAIRPIN_INIT[size]
     } else {
         HAIRPIN_INIT[30]
             + (LOOP_EXTRAPOLATION_COEFF * (size as f64 / 30.0).ln() * 100.0).round() as i32
     };
-
     if size == 3 {
         let w = &seq[i..=j];
         let bonus = triloop_bonus(w);
@@ -376,7 +304,6 @@ fn hairpin_e(seq: &[u8], i: usize, j: usize, pi: usize) -> i32 {
     }
     energy
 }
-
 #[inline]
 fn bulge64(pi: usize, pp: usize, size: usize) -> i64 {
     let mut e = if size <= 30 { BULGE_INIT[size] } else {
@@ -387,7 +314,6 @@ fn bulge64(pi: usize, pp: usize, size: usize) -> i64 {
     if is_au_gu(pp) { e += TERMINAL_AU_PENALTY; }
     e as i64
 }
-
 #[inline]
 fn interior64(
     seq: &[u8],
@@ -397,21 +323,17 @@ fn interior64(
     nl: usize, nr: usize,
 ) -> i64 {
     let total = nl + nr;
-
     if nl == 1 && nr == 1 {
         let mm5 = seq[i + 1] as usize;
         let mm3 = seq[j - 1] as usize;
         let val = INT11[pi][pp][mm5][mm3];
         if val < INF { return val as i64; }
     }
-
     let mut e = if total <= 30 { INTERIOR_INIT[total] } else {
         INTERIOR_INIT[30] + (LOOP_EXTRAPOLATION_COEFF * (total as f64 / 30.0).ln() * 100.0).round() as i32
     };
-
     let asym = (nl as i32 - nr as i32).unsigned_abs() as i32;
     e += (NINIO_M * asym).min(NINIO_MAX);
-
     if !(nl == 1 && nr == 1) {
         let b5o = seq[i + 1] as usize;
         let b3o = seq[j - 1] as usize;
@@ -420,9 +342,7 @@ fn interior64(
         let b5i = if q + 1 < seq.len() { seq[q + 1] as usize } else { 0 };
         e += INTERIOR_MM[pp][b3i][b5i];
     }
-
     if is_au_gu(pi) { e += TERMINAL_AU_PENALTY; }
     if is_au_gu(pp) { e += TERMINAL_AU_PENALTY; }
-
     e as i64
 }
