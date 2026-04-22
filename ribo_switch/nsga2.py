@@ -1,21 +1,3 @@
-"""
-nsga2.py — Multi-objective evolutionary engine using NSGA-II.
-
-Implements Non-dominated Sorting Genetic Algorithm II (Deb et al., 2002)
-for riboswitch inverse design. Returns a Pareto front of candidate sequences
-with varying tradeoffs between ON-state and OFF-state conformational switching.
-
-Objectives (all minimized):
-    - Gap_ON:          E(seq, S_ON)  - MFE(seq) ≥ 0  — how far S_ON is from MFE
-    - Gap_OFF:         E(seq, S_OFF) - MFE(seq) ≥ 0  — how far S_OFF is from MFE
-    - -switching_score: two-state Boltzmann probability of S_ON vs S_OFF
-
-switching_score = sigmoid((E_OFF − E_ON) / kT) ∈ (0, 1).
-> 0.5 means the molecule thermodynamically prefers S_ON over S_OFF.
-This replaces the McCaskill p_on/p_off which collapse to ≈ 0 for sequences
-longer than ~20 nt and provide no useful gradient signal.
-"""
-
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable
@@ -36,45 +18,63 @@ from ribo_switch.rust_bridge import (
 from ribo_switch.fold import FoldResult
 from ribo_switch.brpf import two_state_score, kT_at
 from ribo_switch.turner import TurnerParams
+from ribo_switch.verify import bp_distance_from_tables, bp_f1_from_tables
+
+
+def _mfe_db_to_pair_table(db: str) -> list[int]:
+    
+    n = len(db)
+    pt: list[int] = [-1] * n
+    stack: list[int] = []
+    for i, ch in enumerate(db):
+        if ch == '(':
+            stack.append(i)
+        elif ch == ')':
+            j = stack.pop()
+            pt[j] = i
+            pt[i] = j
+    return pt
 
 
 @dataclass
 class Candidate:
-    """
-    A riboswitch candidate with computed objective values.
 
-    Attributes:
-        individual:      The underlying Individual from genetics.py.
-        e_on:            Energy of sequence in ON structure (0.01 kcal/mol).
-        e_off:           Energy of sequence in OFF structure (0.01 kcal/mol).
-        mfe:             MFE re-evaluated with eval_energy (0.01 kcal/mol).
-        mfe_structure:   MFE structure in dot-bracket notation.
-        switching_score: Two-state Boltzmann P(S_ON) in {S_ON, S_OFF} ∈ (0, 1).
-        gap_on:          E_ON - MFE (≥ 0; how far S_ON is from the MFE).
-        gap_off:         E_OFF - MFE (≥ 0; how far S_OFF is from the MFE).
-        stability:       E_ON + E_OFF (kept for display/summary; not an objective).
-        rank:            Pareto rank (0 = non-dominated).
-        crowding_distance: Diversity measure within a Pareto front.
-    """
     individual: Individual
     e_on: Energy
     e_off: Energy
     mfe: Energy
     mfe_structure: str
     switching_score: float
+    s_on_pt: list[int] = field(default_factory=list, repr=False)
+    s_off_pt: list[int] = field(default_factory=list, repr=False)
+    include_structure_objective: bool = True
     gap_on: int = field(init=False)
     gap_off: int = field(init=False)
     stability: int = field(init=False)
+    bp_dist_on: int = field(init=False)
+    bp_dist_off: int = field(init=False)
+    bp_f1_on: float = field(init=False)
+    bp_f1_off: float = field(init=False)
     rank: int = 0
     crowding_distance: float = 0.0
 
     def __post_init__(self):
-        # fold_mfe and eval_energy now share the identical energy model
-        # (-d2 external dangles, Turner multiloop with closing-pair branch),
-        # so e_on − mfe and e_off − mfe are guaranteed ≥ 0 by construction.
-        self.gap_on = self.e_on - self.mfe
-        self.gap_off = self.e_off - self.mfe
+
+        self.gap_on    = self.e_on - self.mfe
+        self.gap_off   = self.e_off - self.mfe
         self.stability = self.e_on + self.e_off
+
+        if self.s_on_pt and self.s_off_pt and self.mfe_structure:
+            mfe_pt = _mfe_db_to_pair_table(self.mfe_structure)
+            self.bp_dist_on  = bp_distance_from_tables(mfe_pt, self.s_on_pt)
+            self.bp_dist_off = bp_distance_from_tables(mfe_pt, self.s_off_pt)
+            self.bp_f1_on    = bp_f1_from_tables(mfe_pt, self.s_on_pt)
+            self.bp_f1_off   = bp_f1_from_tables(mfe_pt, self.s_off_pt)
+        else:
+            self.bp_dist_on  = 0
+            self.bp_dist_off = 0
+            self.bp_f1_on    = 1.0
+            self.bp_f1_off   = 1.0
 
     @property
     def sequence(self) -> Sequence:
@@ -82,8 +82,11 @@ class Candidate:
 
     @property
     def objectives(self) -> tuple:
-        """Objectives tuple (all minimized): gap_on, gap_off, -switching_score."""
-        return (self.gap_on, self.gap_off, -self.switching_score)
+
+        base = (self.gap_on, self.gap_off, -self.switching_score)
+        if self.include_structure_objective:
+            return base + (self.bp_dist_on,)
+        return base
 
 
 def evaluate_candidate(
@@ -91,29 +94,13 @@ def evaluate_candidate(
     s_on: Structure,
     s_off: Structure,
     params: TurnerParams,
+    include_structure_objective: bool = True,
 ) -> Candidate:
-    """
-    Evaluate an individual to create a Candidate with computed objectives.
-    
-    Args:
-        individual: The sequence with component assignments
-        s_on: ON-state structure
-        s_off: OFF-state structure
-        params: Turner energy parameters
-        
-    Returns:
-        Candidate with all energy values computed
-    """
+  
     seq = individual.sequence
 
-    # One Rust call returns all three energies and the folded structure.
-    # The Rust side re-scores the folded pair-table with eval_energy so the
-    # returned `mfe` uses the identical accounting as `e_on` / `e_off`,
-    # guaranteeing `gap_on ≥ 0` and `gap_off ≥ 0`.
     e_on, e_off, mfe, mfe_struct = _rs_evaluate_candidate(seq, s_on, s_off, params)
 
-    # Two-state switching score: Boltzmann P(S_ON) restricted to {S_ON, S_OFF}.
-    # Replaces McCaskill p_on/p_off which collapse to ≈ 0 for seqs > ~20 nt.
     kT = kT_at(37.0)
     score = two_state_score(e_on, e_off, kT)
 
@@ -124,6 +111,9 @@ def evaluate_candidate(
         mfe=mfe,
         mfe_structure=mfe_struct,
         switching_score=score,
+        s_on_pt=s_on.pair_table,
+        s_off_pt=s_off.pair_table,
+        include_structure_objective=include_structure_objective,
     )
 
 
@@ -132,14 +122,9 @@ def evaluate_individuals_batch(
     s_on: Structure,
     s_off: Structure,
     params: TurnerParams,
+    include_structure_objective: bool = True,
 ) -> list[Candidate]:
-    """Evaluate many individuals in parallel via the Rust batch API.
 
-    When the Rust extension is active, folding runs with the GIL released
-    and rayon fans out across CPU cores. With the pure-Python fallback this
-    reduces to a sequential loop (identical semantics to
-    :func:`evaluate_candidate`).
-    """
     if not individuals:
         return []
 
@@ -155,19 +140,16 @@ def evaluate_individuals_batch(
             mfe=mfe,
             mfe_structure=mfe_db,
             switching_score=two_state_score(e_on, e_off, kT),
+            s_on_pt=s_on.pair_table,
+            s_off_pt=s_off.pair_table,
+            include_structure_objective=include_structure_objective,
         )
         for ind, (e_on, e_off, mfe, mfe_db) in zip(individuals, raw)
     ]
 
 
 def dominates(a: Candidate, b: Candidate) -> bool:
-    """
-    Check if candidate `a` Pareto-dominates candidate `b`.
-    
-    a dominates b iff:
-        - a is at least as good as b on all objectives
-        - a is strictly better than b on at least one objective
-    """
+
     obj_a = a.objectives
     obj_b = b.objectives
     
@@ -178,39 +160,21 @@ def dominates(a: Candidate, b: Candidate) -> bool:
 
 
 def fast_non_dominated_sort(population: list[Candidate]) -> list[list[Candidate]]:
-    """
-    Sort population into Pareto fronts using fast non-dominated sorting.
-
-    Front 0 = non-dominated (best); front k is dominated only by members of
-    fronts 0..k-1.
-
-    Numpy-vectorised: the whole ``N×N`` dominance matrix is computed in one
-    broadcast, and fronts are peeled off by decrementing each remaining
-    candidate's incoming-dominance count.
-
-    Complexity stays ``O(M·N²)`` for the dominance matrix build, but the
-    per-element cost drops to a native-loop add/compare, not a Python
-    ``dominates()`` call.
-    """
     n = len(population)
     if n == 0:
         return []
 
-    # (N, M) float objectives. Each Candidate's `objectives` property already
-    # returns the canonical minimization tuple (gap_on, gap_off, -score).
     obj = np.asarray(
         [c.objectives for c in population], dtype=np.float64
     )
 
-    # dom[i, j] == True  iff  candidate i dominates candidate j
-    diff = obj[:, None, :] - obj[None, :, :]       # (N, N, M)
-    leq = np.all(diff <= 0.0, axis=2)              # (N, N) i ≤ j on every obj
-    lt  = np.any(diff <  0.0, axis=2)              # (N, N) i < j on some obj
+    diff = obj[:, None, :] - obj[None, :, :]       
+    leq = np.all(diff <= 0.0, axis=2)              
+    lt  = np.any(diff <  0.0, axis=2)             
     dom = leq & lt
     np.fill_diagonal(dom, False)
 
-    # domination_count[j] = # of still-remaining candidates that dominate j
-    domination_count = dom.sum(axis=0).astype(np.int32)  # (N,)
+    domination_count = dom.sum(axis=0).astype(np.int32) 
     remaining = np.ones(n, dtype=bool)
 
     fronts: list[list[Candidate]] = []
@@ -218,8 +182,6 @@ def fast_non_dominated_sort(population: list[Candidate]) -> list[list[Candidate]
     while remaining.any():
         front_mask = remaining & (domination_count == 0)
         if not front_mask.any():
-            # Numerical safety net: should not happen for a proper dominance
-            # relation, but drop any stragglers into a final front.
             straggler_idx = np.where(remaining)[0]
             for i in straggler_idx:
                 population[int(i)].rank = front_idx
@@ -231,7 +193,6 @@ def fast_non_dominated_sort(population: list[Candidate]) -> list[list[Candidate]
             population[int(i)].rank = front_idx
         fronts.append([population[int(i)] for i in front_indices])
 
-        # Everyone dominated by this front loses that many incoming edges.
         domination_count -= dom[front_indices].sum(axis=0, dtype=np.int32)
         remaining[front_indices] = False
         front_idx += 1
@@ -240,17 +201,6 @@ def fast_non_dominated_sort(population: list[Candidate]) -> list[list[Candidate]
 
 
 def crowding_distance(front: list[Candidate]) -> None:
-    """
-    Compute crowding distance for each candidate in a Pareto front.
-    
-    Crowding distance measures how isolated a solution is from its neighbors
-    in objective space. Higher distance = more diversity = preferred.
-    
-    Modifies candidates in-place, setting their crowding_distance attribute.
-    
-    Args:
-        front: A list of candidates at the same Pareto rank
-    """
     n = len(front)
     if n == 0:
         return
@@ -288,21 +238,7 @@ def tournament_select(
     rng: random.Random,
     tournament_size: int = 2
 ) -> Candidate:
-    """
-    Select a candidate using tournament selection.
-    
-    Compare random candidates and return the one with:
-    1. Better (lower) Pareto rank, or
-    2. If same rank, higher crowding distance
-    
-    Args:
-        population: Population to select from
-        rng: Random number generator
-        tournament_size: Number of candidates in each tournament
-        
-    Returns:
-        The winning candidate
-    """
+
     contestants = rng.sample(population, min(tournament_size, len(population)))
     
     def key_fn(c: Candidate) -> tuple[int, float]:
@@ -320,30 +256,9 @@ def evolve(
     params: TurnerParams,
     mutation_rate: float,
     rng: random.Random,
+    include_structure_objective: bool = True,
 ) -> list[Candidate]:
-    """
-    Perform one generation of NSGA-II evolution.
-    
-    Steps:
-    1. Select parents via tournament selection
-    2. Create offspring via crossover + mutation
-    3. Combine parents + offspring (size 2N)
-    4. Non-dominated sort
-    5. Compute crowding distances
-    6. Select top N by (rank, crowding distance)
-    
-    Args:
-        population: Current population
-        graph: Constraint graph for genetic operators
-        s_on: ON-state structure
-        s_off: OFF-state structure
-        params: Energy parameters
-        mutation_rate: Probability of mutating each component
-        rng: Random number generator
-        
-    Returns:
-        New population of same size
-    """
+   
     pop_size = len(population)
 
     # Breed all offspring individuals first (cheap, pure Python), then
@@ -363,7 +278,10 @@ def evolve(
         if len(child_inds) < pop_size:
             child_inds.append(child2_ind)
 
-    offspring = evaluate_individuals_batch(child_inds, s_on, s_off, params)
+    offspring = evaluate_individuals_batch(
+        child_inds, s_on, s_off, params,
+        include_structure_objective=include_structure_objective,
+    )
     
     # Combine parents and offspring
     combined = population + offspring
@@ -396,6 +314,17 @@ def evolve(
     return new_population
 
 
+def filter_by_structure(
+    candidates: list[Candidate],
+    max_bp_dist_on: int = 0,
+    max_bp_dist_off: int | None = None,
+) -> list[Candidate]:
+    result = [c for c in candidates if c.bp_dist_on <= max_bp_dist_on]
+    if max_bp_dist_off is not None:
+        result = [c for c in result if c.bp_dist_off <= max_bp_dist_off]
+    return result
+
+
 def nsga2(
     structure_on: str | Structure,
     structure_off: str | Structure,
@@ -405,78 +334,56 @@ def nsga2(
     params: TurnerParams | None = None,
     seed: int | None = None,
     callback: Callable[[int, list[Candidate]], None] | None = None,
+    include_structure_objective: bool = True,
 ) -> list[Candidate]:
-    """
-    Run NSGA-II to design riboswitch sequences.
-    
-    Args:
-        structure_on: ON-state structure (dot-bracket string or Structure)
-        structure_off: OFF-state structure (dot-bracket string or Structure)
-        population_size: Number of individuals in population
-        n_generations: Number of generations to evolve
-        mutation_rate: Probability of mutating each component (0.0 to 1.0)
-        params: Turner parameters (defaults to Turner 2004)
-        seed: Random seed for reproducibility
-        callback: Optional function called each generation with (gen_num, pareto_front)
-        
-    Returns:
-        The final Pareto front of riboswitch candidates
-    """
-    # Parse structures if needed
+   
     if isinstance(structure_on, str):
         structure_on = parse_dot_bracket(structure_on)
     if isinstance(structure_off, str):
         structure_off = parse_dot_bracket(structure_off)
-    
+
     # Initialize
     if params is None:
         params = TurnerParams.turner2004()
-    
+
     rng = random.Random(seed)
-    
+
     # Build constraint graph
     graph = build_constraint_graph(structure_on, structure_off)
-    
+
     # Initialize population — breed all individuals, then evaluate as a batch.
     initial_inds = [create_individual(graph, rng) for _ in range(population_size)]
     population = evaluate_individuals_batch(
-        initial_inds, structure_on, structure_off, params
+        initial_inds, structure_on, structure_off, params,
+        include_structure_objective=include_structure_objective,
     )
-    
+
     # Initial sort
     fronts = fast_non_dominated_sort(population)
     for front in fronts:
         crowding_distance(front)
-    
+
     # Evolution loop
     for gen in range(n_generations):
         population = evolve(
             population, graph, structure_on, structure_off,
-            params, mutation_rate, rng
+            params, mutation_rate, rng,
+            include_structure_objective=include_structure_objective,
         )
-        
+
         # Callback with current Pareto front
         if callback is not None:
             pareto_front = [c for c in population if c.rank == 0]
             callback(gen, pareto_front)
-    
+
     # Return final Pareto front
     fronts = fast_non_dominated_sort(population)
     crowding_distance(fronts[0])
-    
+
     return fronts[0]
 
 
 def summarize_pareto_front(front: list[Candidate]) -> dict:
-    """
-    Generate summary statistics for a Pareto front.
-    
-    Args:
-        front: List of Pareto-optimal candidates
-        
-    Returns:
-        Dictionary with statistics
-    """
     if not front:
         return {"count": 0}
     

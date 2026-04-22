@@ -122,6 +122,11 @@ def write_pareto_json(
             "gap_on_kcal": c.gap_on / 100.0,
             "gap_off_kcal": c.gap_off / 100.0,
             "stability_kcal": c.stability / 100.0,
+            "bp_dist_on": c.bp_dist_on,
+            "bp_dist_off": c.bp_dist_off,
+            "bp_f1_on": round(c.bp_f1_on, 4),
+            "bp_f1_off": round(c.bp_f1_off, 4),
+            "mfe_matches_on": c.bp_dist_on == 0,
             "pareto_rank": c.rank,
             "crowding_distance": c.crowding_distance,
         })

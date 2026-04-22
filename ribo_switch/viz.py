@@ -1,13 +1,3 @@
-"""
-viz.py — Visualization utilities for riboswitch design.
-
-Provides plotting functions for:
-  - Pareto front scatter plots (Gap_ON vs Gap_OFF)
-  - Population convergence over generations
-  - Component diversity analysis
-  - Energy landscape visualization
-"""
-
 from __future__ import annotations
 from typing import TYPE_CHECKING
 import json
@@ -18,17 +8,6 @@ if TYPE_CHECKING:
 
 
 def pareto_front_data(candidates: list) -> dict:
-    """
-    Extract data for Pareto front visualization.
-    
-    Works with both NSGA-II Candidates and CandidateResults.
-    
-    Args:
-        candidates: List of candidates (from NSGA-II or scorer)
-        
-    Returns:
-        Dictionary with x, y, color data for plotting
-    """
     data = {
         "gap_on": [],
         "gap_off": [],
@@ -38,9 +17,7 @@ def pareto_front_data(candidates: list) -> dict:
     }
     
     for c in candidates:
-        # Handle both Candidate and CandidateResult
         if hasattr(c, 'gap_on'):
-            # NSGA-II Candidate
             data["gap_on"].append(c.gap_on / 100.0)  # Convert to kcal/mol
             data["gap_off"].append(c.gap_off / 100.0)
             data["stability"].append(c.stability / 100.0)
@@ -58,15 +35,6 @@ def pareto_front_data(candidates: list) -> dict:
 
 
 def convergence_data(history: list[list]) -> dict:
-    """
-    Extract convergence data from generation history.
-    
-    Args:
-        history: List of Pareto fronts from each generation
-        
-    Returns:
-        Dictionary with convergence metrics per generation
-    """
     data = {
         "generation": [],
         "front_size": [],
@@ -104,16 +72,7 @@ def convergence_data(history: list[list]) -> dict:
 
 
 def component_diversity_data(candidates: list, graph) -> dict:
-    """
-    Analyze component assignment diversity in a population.
-    
-    Args:
-        candidates: List of candidates with component_assignments
-        graph: ConstraintGraph used for the design
-        
-    Returns:
-        Dictionary with diversity metrics per component
-    """
+
     n_components = len(graph.components)
     
     # For each component, collect all unique assignments
@@ -138,16 +97,7 @@ def component_diversity_data(candidates: list, graph) -> dict:
 
 
 def format_pareto_table(candidates: list, max_rows: int = 10) -> str:
-    """
-    Format Pareto front as a text table for terminal display.
-    
-    Args:
-        candidates: List of candidates
-        max_rows: Maximum number of rows to display
-        
-    Returns:
-        Formatted string table
-    """
+
     if not candidates:
         return "No candidates in Pareto front."
     
@@ -158,27 +108,42 @@ def format_pareto_table(candidates: list, max_rows: int = 10) -> str:
         sorted_cands = sorted(candidates, key=lambda c: c.gap_s1 + c.gap_s2)
     
     lines = []
-    header = f"{'#':>3} {'Gap_ON':>8} {'Gap_OFF':>8} {'Stability':>10} {'Sequence':>20}"
+    header = (
+        f"{'#':>3} {'Gap_ON':>8} {'Gap_OFF':>8} "
+        f"{'bpΔ_ON':>7} {'bpΔ_OFF':>7} "
+        f"{'Stability':>10} {'Sequence':>20}"
+    )
     lines.append(header)
     lines.append("-" * len(header))
-    
+
     for i, c in enumerate(sorted_cands[:max_rows]):
         if hasattr(c, 'gap_on'):
-            gap_on = c.gap_on / 100.0
-            gap_off = c.gap_off / 100.0
+            gap_on    = c.gap_on / 100.0
+            gap_off   = c.gap_off / 100.0
             stability = c.stability / 100.0
-            seq = str(c.sequence)
+            seq       = str(c.sequence)
+            bp_on     = c.bp_dist_on
+            bp_off    = c.bp_dist_off
         else:
-            gap_on = c.gap_s1
-            gap_off = c.gap_s2
+            gap_on    = c.gap_s1
+            gap_off   = c.gap_s2
             stability = c.stability
-            seq = c.sequence
-        
+            seq       = c.sequence
+            bp_on     = getattr(c, 'bp_dist_on', "-")
+            bp_off    = getattr(c, 'bp_dist_off', "-")
+
         # Truncate sequence if needed
         if len(seq) > 20:
             seq = seq[:17] + "..."
-        
-        lines.append(f"{i+1:>3} {gap_on:>8.2f} {gap_off:>8.2f} {stability:>10.2f} {seq:>20}")
+
+        bp_on_str  = f"{bp_on:>7}"  if isinstance(bp_on,  int) else f"{'?':>7}"
+        bp_off_str = f"{bp_off:>7}" if isinstance(bp_off, int) else f"{'?':>7}"
+
+        lines.append(
+            f"{i+1:>3} {gap_on:>8.2f} {gap_off:>8.2f} "
+            f"{bp_on_str} {bp_off_str} "
+            f"{stability:>10.2f} {seq:>20}"
+        )
     
     if len(sorted_cands) > max_rows:
         lines.append(f"... and {len(sorted_cands) - max_rows} more candidates")
@@ -187,13 +152,7 @@ def format_pareto_table(candidates: list, max_rows: int = 10) -> str:
 
 
 def export_pareto_json(candidates: list, filepath: str) -> None:
-    """
-    Export Pareto front to JSON file.
-    
-    Args:
-        candidates: List of candidates
-        filepath: Output file path
-    """
+
     data = pareto_front_data(candidates)
     
     # Add full sequences
@@ -212,16 +171,7 @@ def export_pareto_json(candidates: list, filepath: str) -> None:
 
 
 def try_matplotlib_plot(candidates: list, output_path: str = None) -> bool:
-    """
-    Try to create a matplotlib scatter plot of the Pareto front.
-    
-    Args:
-        candidates: List of candidates
-        output_path: If provided, save to file; otherwise show plot
-        
-    Returns:
-        True if successful, False if matplotlib not available
-    """
+
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -265,16 +215,7 @@ def try_matplotlib_plot(candidates: list, output_path: str = None) -> bool:
 
 
 def try_convergence_plot(history: list[list], output_path: str = None) -> bool:
-    """
-    Try to create a convergence plot showing optimization progress.
-    
-    Args:
-        history: List of Pareto fronts from each generation
-        output_path: If provided, save to file
-        
-    Returns:
-        True if successful, False if matplotlib not available
-    """
+
     try:
         import matplotlib.pyplot as plt
     except ImportError:

@@ -22,6 +22,7 @@ dev = [
 
 [project.scripts]
 ribo-design = "ribo_switch.main:design"
+ribo-verify = "ribo_switch.main:verify"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
